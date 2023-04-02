@@ -40,6 +40,13 @@
         https://github.com/FranciscoNabas
 #>
 
+<#
+    TODO: There is something under '$env:SystemRoot\SysWOW64' that freezes the byte reading.
+    I tried this function in about 31000 files (everything under $env:SystemRoot).
+    Maybe the images are too big? Something is not being disposed correctly in the loop?
+    NO ONE KNOWS.
+#>
+
 function Get-PdbSymbol {
 
     [CmdletBinding()]
@@ -54,6 +61,9 @@ function Get-PdbSymbol {
     #Requires -Version 7.3
 
     Begin {
+
+        [void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms')
+
         # https://stackoverflow.com/questions/21422364/is-there-any-way-to-monitor-the-progress-of-a-download-using-a-webclient-object
         function Invoke-FileDownloadWithProgress($Url, $TargetFile, $ParentProgressBarId = -1) {
             $uri = New-Object "System.Uri" "$Url"
@@ -75,6 +85,9 @@ function Get-PdbSymbol {
                     $count = $responseStream.Read($buffer, 0, $buffer.length)
                     $downloadedBytes = $downloadedBytes + $count
                     Write-Progress -Id ($ParentProgressBarId + 1) -ParentId $ParentProgressBarId -Activity "Downloading file '$($Url.split('/') | Select-Object -Last 1)'" -Status "Downloaded ($([System.Math]::Floor($downloadedBytes/1024))K of $($totalLength)K): " -PercentComplete ((([System.Math]::Floor($downloadedBytes / 1024)) / $totalLength) * 100)
+                    if ([System.Math]::Floor($downloadedBytes / 1024) -eq $totalLength) {
+                        break
+                    }
                 }
             }
             catch {
@@ -93,16 +106,17 @@ function Get-PdbSymbol {
 
             try {
                 $bytes = $Reader.ReadBytes([System.Runtime.InteropServices.Marshal]::SizeOf(([type]$Type)))
-                $gcHandle = [System.Runtime.InteropServices.GCHandle]::Alloc($bytes, [System.Runtime.InteropServices.GCHandleType]::Pinned)
-                return [System.Runtime.InteropServices.Marshal]::PtrToStructure($gcHandle.AddrOfPinnedObject(), ([type]$Type))
+                if ($bytes.Count -gt 0) {
+
+                    # Technically we don't need to pin the address of 'bytes' because 'PtrToStructure' is going to copy the data before it goes out of scope. Maybe?
+                    $hBytes = [System.Runtime.InteropServices.Marshal]::UnsafeAddrOfPinnedArrayElement($bytes, 0)
+                    return [System.Runtime.InteropServices.Marshal]::PtrToStructure($hBytes, ([type]$Type))
+                }
             }
             catch {
                 if ($PSItem.Exception.InnerException.GetType() -ne [System.ObjectDisposedException]) {
                     throw $PSItem
                 }
-            }
-            finally {
-                $gcHandle.Free()    
             }
         }
 
@@ -397,7 +411,9 @@ function Get-PdbSymbol {
     
         $processedFileCount = 1
         foreach ($file in $Path) {
-    
+            
+            Write-Progress -Id 1 -Activity 'Downloading Symbols' -Status "Processed files: $processedFileCount/$($Path.Count). $file" -PercentComplete (($processedFileCount / $Path.Count) * 100)
+
             if ($existingFilenames.Contains([System.IO.Path]::GetFileNameWithoutExtension($file)) -or $failedFileNames.Contains($file)) {
                 Write-Progress -Id 1 -Activity 'Downloading Symbols' -Status "Processed files: $processedFileCount/$($Path.Count)" -PercentComplete (($processedFileCount / $Path.Count) * 100)
                 $processedFileCount++
@@ -495,11 +511,13 @@ function Get-PdbSymbol {
                         }
                     }
                 }
+
+                $fileStream.Flush()
+                $fileStream.Dispose() 
+                $reader.Dispose()
+                
+                $processedFileCount++
             }
-            
-            $fileStream.Dispose()
-            Write-Progress -Id 1 -Activity 'Downloading Symbols' -Status "Processed files: $processedFileCount/$($Path.Count)" -PercentComplete (($processedFileCount / $Path.Count) * 100)
-            $processedFileCount++
         }
     }
 
