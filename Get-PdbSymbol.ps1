@@ -180,21 +180,20 @@ function Get-PdbSymbol {
 
             $timeout = 0
             do {
+                ## Making a copy of $sync to display the progress. If it gets modified in the loop, PS throws and exception.
+                $syncCopy = $sync
 
                 ## Probe the job each millisecond. Most files are small.
                 Start-Sleep -Milliseconds 1
-                if ($DownloadTimeout -gt 0 -and ![string]::IsNullOrEmpty($sync.Status)) {
+                if ($DownloadTimeout -gt 0 -and ![string]::IsNullOrEmpty($syncCopy.Status)) {
                     try {
                         <#
                             The job is constantly outputing the download percentage.
                             If ReadAll() returns 0 members, means the download percentage is the same.
                         #>
-
-                        ## Making a copy of $sync to display the progress. If it gets modified in the loop, PS throws and exception.
-                        $syncCopy = $sync
                         Write-Progress -Id ($ParentProgressBarId + 1) -ParentId $ParentProgressBarId @syncCopy
                         $lastPercentage = $syncCopy.PercentComplete
-                        
+
                         if ($lastPercentage.Count -eq 0) { $timeout++ }
                         else { $timeout = 0 }
         
