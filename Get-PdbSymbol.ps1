@@ -52,56 +52,170 @@ function Get-PdbSymbol {
     [CmdletBinding()]
     param (
         [Parameter(Mandatory, Position = 0)]
+        [ValidateScript({
+            if (!$PSItem -or $PSItem.Count -lt 1) { throw [System.ArgumentException]::new('"Path" needs to have at least one file path.') }
+            return $true
+        })]
         [string[]]$Path,
 
         [Parameter(Position = 1)]
-        [string]$DestinationStore = 'C:\Symbols'
+        [ValidateNotNullOrEmpty()]
+        [string]$DestinationStore = 'C:\Symbols',
+
+        [Parameter()]
+        [ValidateRange(0, [int]::MaxValue)]
+        [int]$DownloadTimeout = 15,
+
+        [Parameter()]
+        [ValidateRange(0, [int]::MaxValue)]
+        [int]$Retry = 3
     )
 
     #Requires -Version 7.3
 
     Begin {
 
-        [void][System.Reflection.Assembly]::LoadWithPartialName('System.Windows.Forms')
+        ## Download fail list. Used for retrying at the end.
+        [System.Collections.ArrayList]$Global:failedDownload = @()
+        $Global:otherFailure = [System.IO.File]::AppendText("$DestinationStore\.OtherFailure.log")
 
-        # https://stackoverflow.com/questions/21422364/is-there-any-way-to-monitor-the-progress-of-a-download-using-a-webclient-object
+        <#
+            This function manages file download and progress display.
+            Based on: https://stackoverflow.com/questions/21422364/is-there-any-way-to-monitor-the-progress-of-a-download-using-a-webclient-object
+        #>
         function Invoke-FileDownloadWithProgress($Url, $TargetFile, $ParentProgressBarId = -1) {
-            $uri = New-Object "System.Uri" "$Url"
-            $request = [System.Net.HttpWebRequest]::Create($uri)
-            $request.set_Timeout(15000) #15 second timeout
-    
-            try {
-                $response = $request.GetResponse()
-                $totalLength = [System.Math]::Floor($response.get_ContentLength() / 1024)
-                $responseStream = $response.GetResponseStream()
-                $targetStream = New-Object -TypeName System.IO.FileStream -ArgumentList $TargetFile, Create
-                $buffer = new-object byte[] 10KB
-                $count = $responseStream.Read($buffer, 0, $buffer.length)
-                $downloadedBytes = $count
-    
-                while ($count -gt 0) {
+            $scriptBlock = {
 
-                    $targetStream.Write($buffer, 0, $count)
+                ## Creates a HTTP request based on the symbol download URL.
+                $uri = [System.Uri]::new($Url)
+                $request = [System.Net.HttpWebRequest]::Create($uri)
+                $request.Timeout = 15000
+    
+                try {
+
+                    ## Gets the firs response and set values for the progress bar.
+                    $response = $request.GetResponse()
+                    $totalLength = [System.Math]::Floor($response.ContentLength / 1024)
+                    $responseStream = $response.GetResponseStream()
+
+                    ## Creating target directory. Doing this here avoids unecessary cleanup.
+                    $targetDir = [System.IO.Path]::GetDirectoryName($TargetFile)
+                    if (!(Test-Path -Path $targetDir)) {
+                        [void](New-Item -Path $targetDir -ItemType Directory)
+                    }
+
+                    ## Creates the file.
+                    $targetStream = [System.IO.FileStream]::new($TargetFile, [System.IO.FileMode]::Create)
+                    $buffer = [byte[]]::new(10KB)
                     $count = $responseStream.Read($buffer, 0, $buffer.length)
-                    $downloadedBytes = $downloadedBytes + $count
-                    Write-Progress -Id ($ParentProgressBarId + 1) -ParentId $ParentProgressBarId -Activity "Downloading file '$($Url.split('/') | Select-Object -Last 1)'" -Status "Downloaded ($([System.Math]::Floor($downloadedBytes/1024))K of $($totalLength)K): " -PercentComplete ((([System.Math]::Floor($downloadedBytes / 1024)) / $totalLength) * 100)
-                    if ([System.Math]::Floor($downloadedBytes / 1024) -eq $totalLength) {
-                        break
+    
+                    ## File download.
+                    $downloadedBytes = $count
+                    while ($count -gt 0) {
+
+                        $targetStream.Write($buffer, 0, $count)
+                        $count = $responseStream.Read($buffer, 0, $buffer.length)
+                        $downloadedBytes = $downloadedBytes + $count
+
+                        ## Sending progress status to the main thread.
+                        $sync.Activity = "Downloading file '$(($Url).split('/')) | Select-Object -Last 1)'"
+                        $sync.Status = "Downloaded ($([System.Math]::Floor($downloadedBytes/1024))K of $($totalLength)K): "
+                        $sync.PercentComplete = (([System.Math]::Floor($downloadedBytes / 1024) / $totalLength) * 100)
+
+                        if ([System.Math]::Floor($downloadedBytes / 1024) -eq $totalLength) {
+                            break
+                        }
                     }
                 }
-            }
-            catch {
-                throw $PSItem
-            }
-            finally {
-                if ($targetStream) {
-                    $targetStream.Flush()
-                    $targetStream.Dispose()
+                catch {
+                    if ($PSItem.Exception.Message -like '*(404) Not Found*') {
+                        [void]$cacheWriter.WriteAsync("$([System.IO.Path]::GetFileNameWithoutExtension($TargetFile))`n")
+                    }
+                    else {
+                        [void]$otherFailure.WriteAsync("$([System.IO.Path]::GetFileNameWithoutExtension($TargetFile));$($PSItem.Exception.HResult);$($PSItem.Exception.Message)`n")
+                    }
                 }
-                if ($responseStream) { $responseStream.Dispose() }
+                finally {
+
+                    ## Cleanup
+                    if ($targetStream) {
+                        $targetStream.Flush()
+                        $targetStream.Dispose()
+                    }
+                    if ($responseStream) { $responseStream.Dispose() }
+                }
             }
+
+            <#
+                We want to monitor the download job from outsite, so we can enforce a timeout.
+                If a file download percentage stays the same for more than $DownloadTimeout,
+                we terminate it and add the URL in the failed list for retrying later.
+                
+                NOTE: The loop takes a little longer than 10 milliseconds because of the other operations.
+                The timeout will always be a little longer than the specified.
+            #>
+
+            ## A synchronized hashtable is a thread safe table we use to display progress of a task running in another runspace.
+            ## https://learn.microsoft.com/en-us/powershell/scripting/learn/deep-dives/write-progress-across-multiple-threads?view=powershell-7.3
+            $sync = [hashtable]::Synchronized(@{
+                Activity = ''
+                Status = ''
+                PercentComplete = 0
+            })
+
+            $runspace = [runspacefactory]::CreateRunspace()
+            $runspace.ApartmentState = [System.Threading.ApartmentState]::STA
+            $runspace.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::UseNewThread
+            $runspace.Open()
+            $runspace.SessionStateProxy.SetVariable('cacheWriter', $Global:cacheWriter)
+            $runspace.SessionStateProxy.SetVariable('TargetFile', $TargetFile)
+            $runspace.SessionStateProxy.SetVariable('otherFailure', $Global:otherFailure)
+            $runspace.SessionStateProxy.SetVariable('Url', $Url)
+            $runspace.SessionStateProxy.SetVariable('sync', $sync)
+
+            $powershell = [powershell]::Create()
+            $powershell.Runspace = $runspace
+            [void]$powershell.AddScript($scriptBlock)
+            [void]$powershell.BeginInvoke()
+
+            $timeout = 0
+            do {
+
+                ## Probe the job each millisecond. Most files are small.
+                Start-Sleep -Milliseconds 1
+                if ($DownloadTimeout -gt 0 -and ![string]::IsNullOrEmpty($sync.Status)) {
+                    try {
+                        <#
+                            The job is constantly outputing the download percentage.
+                            If ReadAll() returns 0 members, means the download percentage is the same.
+                        #>
+                        Write-Progress -Id ($ParentProgressBarId + 1) -ParentId $ParentProgressBarId @sync
+                        $lastPercentage = $sync.PercentComplete
+                        if ($lastPercentage.Count -eq 0) { $timeout++ }
+                        else { $timeout = 0 }
+        
+                        if (($timeout / 1000) -ge $DownloadTimeout) {
+                            $Global:failedDownload.Add([PSCustomObject]@{
+                                FileName = [System.IO.Path]::GetFileName($TargetFile)
+                                Url = $Url
+                            })
+                            break
+                        }    
+                    }
+                    catch {
+                        throw $PSItem
+                    }
+                }
+
+            } while ($powershell.InvocationStateInfo.State -eq 'Running')
+
+            $powershell.Dispose()
+            $runspace.Dispose()
         }
 
+        <#
+            This function reads bytes from the file stream and marshals it to it's corresponding structure.
+        #>
         function Get-ObjectFromStreamBytes([System.IO.BinaryReader]$Reader, [type]$Type) {
 
             try {
@@ -114,12 +228,16 @@ function Get-PdbSymbol {
                 }
             }
             catch {
+
                 if ($PSItem.Exception.InnerException.GetType() -ne [System.ObjectDisposedException]) {
                     throw $PSItem
                 }
             }
         }
 
+        <#
+            This function advances the stream position to the given value.
+        #>
         function Invoke-StreamSeek($Stream, $Offset, $Origin) {
             
             try {
@@ -394,6 +512,7 @@ function Get-PdbSymbol {
         }
         catch { }
         
+        ## Listing already existing files on the '$DownloadStore'.
         $gciSplat = @{
             Path        = $DestinationStore
             ErrorAction = 'SilentlyContinue'
@@ -404,22 +523,32 @@ function Get-PdbSymbol {
         [System.Collections.Generic.HashSet[string]]$existingFilenames = (Get-ChildItem @gciSplat).BaseName
         if (!$existingFilenames) { $existingFilenames = [System.Collections.Generic.HashSet[string]]::new() }
 
+        ## Load the list of failed downloads so we don't try again. Not all files have symbols at the Microsoft store.
         [System.Collections.Generic.HashSet[string]]$failedFileNames = Get-Content -Path "$DestinationStore\.GetPdbSyFailedCache.log" -ErrorAction SilentlyContinue
         if (!$failedFileNames) { $failedFileNames = [System.Collections.Generic.HashSet[string]]::new() }
         
-        $cacheWriter = [System.IO.File]::AppendText("$DestinationStore\.GetPdbSyFailedCache.log")
+        $Global:cacheWriter = [System.IO.File]::AppendText("$DestinationStore\.GetPdbSyFailedCache.log")
     
         $processedFileCount = 1
         foreach ($file in $Path) {
             
             Write-Progress -Id 1 -Activity 'Downloading Symbols' -Status "Processed files: $processedFileCount/$($Path.Count). $file" -PercentComplete (($processedFileCount / $Path.Count) * 100)
 
-            if ($existingFilenames.Contains([System.IO.Path]::GetFileNameWithoutExtension($file)) -or $failedFileNames.Contains($file)) {
+            ## Skipping already existing files, or previous failed downloads.
+            $fileBaseName = [System.IO.Path]::GetFileNameWithoutExtension($file)
+            if ($existingFilenames.Contains($fileBaseName) -or $failedFileNames.Contains($fileBaseName)) {
                 Write-Progress -Id 1 -Activity 'Downloading Symbols' -Status "Processed files: $processedFileCount/$($Path.Count)" -PercentComplete (($processedFileCount / $Path.Count) * 100)
                 $processedFileCount++
                 continue
             }
     
+            <#
+                The next region was converted from PDB-Downloader.
+                I'm not 200% sure on how debug information should be stored into images, and why all steps are needed here.
+                In summary, we read the image's headers looking for debug information.
+                This is done by loading the file into memory, reading byte 'chunks', and marshaling them to the corresponding structures.
+            #>
+            ## Loading file in memory, and creating the BinaryReader.
             try {
                 $fileStream = [System.IO.FileStream]::new($file, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
                 $reader = [System.IO.BinaryReader]::new($fileStream, [System.Text.Encoding]::UTF8)    
@@ -427,15 +556,23 @@ function Get-PdbSymbol {
             # Not good, I know.
             catch { continue }
             
+            ## Reading IMAGE_DOS_HEADER.
             $dosHeader = Get-ObjectFromStreamBytes -Reader $reader -Type ([type][IMAGE_DOS_HEADER])
             
+            ## Advancing stream position.
             Invoke-StreamSeek -Stream $fileStream -Offset $dosHeader.e_lfanew -Origin ([System.IO.SeekOrigin]::Begin)
             try { [void]$reader.ReadUInt32() }
             # Not good, I know.
             catch { continue }
             
+            ## Reading IMAGE_FILE_HEADER and IMAGE_OPTIONAL_HEADER64/IMAGE_OPTIONAL_HEADER32.
             $fileHeader = Get-ObjectFromStreamBytes -Reader $reader -Type ([type][IMAGE_FILE_HEADER])
-            $optHeader = Get-ObjectFromStreamBytes -Reader $reader -Type ([type][IMAGE_OPTIONAL_HEADER64])
+            if ($fileHeader.Machine -eq 0x14C) {
+                $optHeader = Get-ObjectFromStreamBytes -Reader $reader -Type ([type][IMAGE_OPTIONAL_HEADER32])
+            }
+            else {
+                $optHeader = Get-ObjectFromStreamBytes -Reader $reader -Type ([type][IMAGE_OPTIONAL_HEADER64])
+            }
 
             $offDebug = 0
             $cbFromHeader = 0
@@ -443,6 +580,7 @@ function Get-PdbSymbol {
             $cbDebug = $optHeader.Debug.Size
             $imgSecHeader = [IMAGE_SECTION_HEADER[]]::new($fileHeader.NumberOfSections)
             
+            ## Reading all section headers.
             for ($headerNo = 0; $headerNo -lt $imgSecHeader.Length; $headerNo++) {
                 
                 $imgSecHeader[$headerNo] = Get-ObjectFromStreamBytes -Reader $reader -Type ([type][IMAGE_SECTION_HEADER])
@@ -459,8 +597,10 @@ function Get-PdbSymbol {
             
             }
             
+            ## Advancing stream position.
             Invoke-StreamSeek -Stream $fileStream -Offset $offDebug -Origin ([System.IO.SeekOrigin]::Begin)
             
+            ## Reading debug information.
             while ($cbDebug -ge [System.Runtime.InteropServices.Marshal]::SizeOf([type][IMAGE_DEBUG_DIRECTORY])) {
                 if ($loopExit -eq 0) {
                     
@@ -470,11 +610,14 @@ function Get-PdbSymbol {
             
                     if ($imgDebugDir.Type -eq 2) {
                         
+                        ## Advancing stream position.
                         Invoke-StreamSeek -Stream $fileStream -Offset $imgDebugDir.PointerToRawData -Origin ([System.IO.SeekOrigin]::Begin)
                         $debugInfo = Get-ObjectFromStreamBytes -Reader $reader -Type ([type][IMAGE_DEBUG_DIRECTORY_RAW])
                         
                         $loopExit = 1
                         if ([string]::new($debugInfo.name).Contains('.ni.')) {
+                            
+                            ## Advancing stream position.
                             Invoke-StreamSeek -Stream $fileStream -Offset $seekPosition -Origin ([System.IO.SeekOrigin]::Begin)
                             $loopExit = 0
                         }
@@ -488,40 +631,69 @@ function Get-PdbSymbol {
                 $cbDebug -= [System.Runtime.InteropServices.Marshal]::SizeOf([type][IMAGE_DEBUG_DIRECTORY])
             }
             
+            ## Download stage.
             $pdbName = [string]::new($debugInfo.name)
             if (![string]::IsNullOrEmpty($pdbName)) {
-                $pdbName = $pdbName.Remove(($pdbName | Select-String -Pattern '\0').Matches[0].Index).Split('\')[$pdbName.Split('\').Length - 1]
-                $pdbAge = $debugInfo.age.ToString('X')
-                
-                $destinationPath = "$DestinationStore\$pdbName\$($debugInfo.guid.ToString('N').ToUpper())$pdbAge"
-                
-                if (!(Test-Path -Path "$destinationPath\$pdbName" -PathType Leaf)) {
-                    if (!(Test-Path -Path $destinationPath -PathType Container)) {
-                        [void](mkdir $destinationPath)
-                    }
-                    $downloadUrl = "http://msdl.microsoft.com/download/symbols/$pdbName/$($debugInfo.guid.ToString('N').ToUpper())$pdbAge/$pdbName"
-                    
-                    try {
-                        Invoke-FileDownloadWithProgress -Url $downloadUrl -TargetFile "$destinationPath\$pdbName" -ParentProgressBarId 1
-                    }
-                    catch {
-                        if ($PSItem.Exception.InnerException.Message -like '*404*') {
-                            Remove-Item -Path $destinationPath -Force -ErrorAction SilentlyContinue
-                            [void]$cacheWriter.WriteAsync("$file`n")
-                        }
-                    }
-                }
 
-                $fileStream.Flush()
-                $fileStream.Dispose() 
-                $reader.Dispose()
+                $pdbName = $pdbName.Remove(($pdbName | Select-String -Pattern '\0').Matches[0].Index).Split('\')[$pdbName.Split('\').Length - 1]
+
+                if (![string]::IsNullOrEmpty($pdbName)) {
+                    ## Debug file age.
+                    $pdbAge = $debugInfo.age.ToString('X')
                 
-                $processedFileCount++
+                    ## Creating the destination path. Here we try to mimic SymChk.exe directory structure.
+                    $pdbCode = "$($debugInfo.guid.ToString('N').ToUpper())$pdbAge"
+                    $destinationPath = "$DestinationStore\$pdbName\$pdbCode"
+
+                    ## Assembling the download URL.
+                    $downloadUrl = "http://msdl.microsoft.com/download/symbols/$pdbName/$pdbCode/$pdbName"
+    
+                    ## Download job.
+                    Invoke-FileDownloadWithProgress -Url $downloadUrl -TargetFile "$destinationPath\$pdbName" -ParentProgressBarId 1
+
+                    ## Cleanup.
+                    $fileStream.Flush()
+                    $fileStream.Dispose() 
+                    $reader.Dispose()
+
+                    $processedFileCount++
+                }
             }
         }
+
+        ## Managing retries.
+        if ($Global:failedDownload.Count -gt 0 -and $Retry -gt 0) {
+
+            ## Moving the list so we can compare after retries.
+            $currentFailedList = $Global:failedDownload
+            $Global:failedDownload = [System.Collections.ArrayList]::new()
+
+            do {
+                foreach ($failure in $currentFailedList) {
+                    $retries = 0
+                    Write-Progress -Id 1 -Activity 'Retrying download.' -Status "File: $($failure.FileName). Retries: $($retries + 1)/$Retry." -PercentComplete (($retries / $Retry) * 100)
+                }
+
+                ## If list count it's still 0, all retries succeeded.
+                if ($Global:failedDownload.Count -eq 0) {
+                    break
+                }
+
+                $retries++
+
+            } while ($retries -lt $Retry)
+        }
+        
     }
 
     Clean {
-        $cacheWriter.Dispose()
+
+        <#
+            The 'Clean' block is particularly useful in this situation.
+            This disposal happens even if the user cancels stript execution with 'Ctrl+C'.
+            If the stream is not disposed, the cache file keeps locked untill the caller PowerShell process dies.
+        #>
+        $Global:cacheWriter.Dispose()
+        $Global:otherFailure.Dispose()
     }
 }
