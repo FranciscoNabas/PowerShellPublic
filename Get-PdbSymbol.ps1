@@ -8,7 +8,6 @@
         This function downloads symbols from the Microsoft store.
         It is based on the PDB-Downloader application.
         It was optimized to run in a console with huge file lists.
-        It was also optimized to return to the previous state fast, if the execution is interrupted.
 
     .PARAMETER Path
 
@@ -30,8 +29,8 @@
     .NOTES
 
         This script is provided under the MIT license.
-        Version: 1.2.0
-        Release date: 07-APR-2023
+        Version: 1.0.0
+        Release date: 31-03-2023
         Author: Francisco Nabas
 
     .LINK
@@ -154,9 +153,6 @@ function Get-PdbSymbol {
                 We want to monitor the download job from outsite, so we can enforce a timeout.
                 If a file download percentage stays the same for more than $DownloadTimeout,
                 we terminate it and add the URL in the failed list for retrying later.
-                
-                NOTE: The loop takes a little longer than 1 millisecond because of the other operations.
-                The timeout will always be a little longer than the specified.
             #>
 
             ## A synchronized hashtable is a thread safe table we use to display progress of a task running in another runspace.
@@ -198,8 +194,8 @@ function Get-PdbSymbol {
                     Write-Progress @syncCopy
                 }
 
-                ## Probe the job each millisecond. Most files are small.
-                Start-Sleep -Milliseconds 1
+                ## Probe the job each tick. Most files are small, and gives almost real time response from the download thread.
+                Start-Sleep -Duration ([timespan]::new(1))
                 if ($DownloadTimeout -gt 0) {
                     try {
                         <#
@@ -211,7 +207,8 @@ function Get-PdbSymbol {
                         if ($lastPercentage.Count -eq 0) { $timeout++ }
                         else { $timeout = 0 }
         
-                        if (($timeout / 1000) -ge $DownloadTimeout) {
+                        ## There are 10,000,000 ticks in a second.
+                        if (($timeout / 10000000) -ge $DownloadTimeout) {
                             $Global:failedDownload.Add([PSCustomObject]@{
                                 FileName = [System.IO.Path]::GetFileName($TargetFile)
                                 Url = $Url
