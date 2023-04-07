@@ -118,7 +118,7 @@ function Get-PdbSymbol {
                         $downloadedBytes = $downloadedBytes + $count
 
                         ## Sending progress status to the main thread.
-                        $sync.Activity = "Downloading file '$(($Url).split('/')) | Select-Object -Last 1)'"
+                        $sync.Activity = "Downloading file '$([System.IO.Path]::GetFileName($TargetFile))'"
                         $sync.Status = "Downloaded ($([System.Math]::Floor($downloadedBytes/1024))K of $($totalLength)K): "
                         $sync.PercentComplete = (([System.Math]::Floor($downloadedBytes / 1024) / $totalLength) * 100)
 
@@ -189,8 +189,12 @@ function Get-PdbSymbol {
                             The job is constantly outputing the download percentage.
                             If ReadAll() returns 0 members, means the download percentage is the same.
                         #>
-                        Write-Progress -Id ($ParentProgressBarId + 1) -ParentId $ParentProgressBarId @sync
-                        $lastPercentage = $sync.PercentComplete
+
+                        ## Making a copy of $sync to display the progress. If it gets modified in the loop, PS throws and exception.
+                        $syncCopy = $sync
+                        Write-Progress -Id ($ParentProgressBarId + 1) -ParentId $ParentProgressBarId @syncCopy
+                        $lastPercentage = $syncCopy.PercentComplete
+                        
                         if ($lastPercentage.Count -eq 0) { $timeout++ }
                         else { $timeout = 0 }
         
