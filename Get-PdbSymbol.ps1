@@ -8,6 +8,7 @@
         This function downloads symbols from the Microsoft store.
         It is based on the PDB-Downloader application.
         It was optimized to run in a console with huge file lists.
+        It was also optimized to return to the previous state fast, if the execution is interrupted.
 
     .PARAMETER Path
 
@@ -29,8 +30,8 @@
     .NOTES
 
         This script is provided under the MIT license.
-        Version: 1.0.0
-        Release date: 31-03-2023
+        Version: 1.2.0
+        Release date: 07-APR-2023
         Author: Francisco Nabas
 
     .LINK
