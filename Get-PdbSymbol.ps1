@@ -30,7 +30,7 @@
     .NOTES
 
         This script is provided under the MIT license.
-        Version: 1.2.0
+        Version: 1.2.1
         Release date: 07-APR-2023
         Author: Francisco Nabas
 
@@ -181,6 +181,7 @@ function Get-PdbSymbol {
             [void]$powershell.BeginInvoke()
 
             $timeout = 0
+            $previousPercentage = 0
             $progId = $ParentProgressBarId + 1
             do {
                 ## Making a copy of $sync to display the progress. If it gets modified in the loop, PS throws and exception.
@@ -199,14 +200,11 @@ function Get-PdbSymbol {
                 Start-Sleep -Duration ([timespan]::new(1))
                 if ($DownloadTimeout -gt 0) {
                     try {
-                        <#
-                            The job is constantly outputing the download percentage.
-                            If ReadAll() returns 0 members, means the download percentage is the same.
-                        #>
-                        $lastPercentage = $syncCopy.PercentComplete
-
-                        if ($lastPercentage.Count -eq 0) { $timeout++ }
-                        else { $timeout = 0 }
+                        if ($previousPercentage -eq $syncCopy.PercentComplete) { $timeout++ }
+                        else {
+                            $timeout = 0
+                            $previousPercentage = $syncCopy.PercentComplete
+                        }
         
                         ## There are 10,000,000 ticks in a second.
                         if (($timeout / 10000000) -ge $DownloadTimeout) {
