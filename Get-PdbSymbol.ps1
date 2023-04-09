@@ -19,19 +19,39 @@
         The path where we want to store the symbols.
         Default value is 'C:\Symbols'.
 
+    .PARAMETER ReadTimeout
+
+        Timeout in seconds the for the binary read operation.
+        If no debug information is found within the timeout, the file is marked as 'No Debug Info'.
+        Input '0' is infinite.
+        Default is 60 seconds.
+
+    .PARAMETER DownloadTimeout
+
+        Timeout in seconds for the download.
+        The timeout stopwatch only starts if the download is stuck in the same progress percentage.
+        If a download times out, it's added to a retry list.
+        Input '0' is infinite.
+        Default is 15 seconds.
+
+    .PARAMETER Retry
+
+        The number of retries for timed out downloads.
+        Default is 3 times.
+
     .EXAMPLE
 
         PS C:\>_ [string[]]$fileList = (Get-ChildItem -Path 'C:\Windows\System32' -Recurse -Force -File | Where-Object {
             ($PSItem.Name -like '*.exe') -or ($PSItem.Name -like '*.dll')
         }).FullName
         
-        PS C:\>_ Get-PdbSymbol -Path $fileList -DestinationStore 'C:\Symbols'
+        PS C:\>_ Get-PdbSymbol -Path $fileList -DestinationStore 'C:\Symbols' -ReadTimeout 30 -DownloadTimeout 10 -Retry 0
 
     .NOTES
 
         This script is provided under the MIT license.
-        Version: 1.2.1
-        Release date: 07-APR-2023
+        Version: 1.3.0
+        Release date: 09-APR-2023
         Author: Francisco Nabas
 
     .LINK
@@ -45,26 +65,33 @@ function Get-PdbSymbol {
 
     [CmdletBinding()]
     param (
-        [Parameter(Mandatory, Position = 0)]
+        [Parameter(
+            Mandatory,
+            Position = 0,
+            HelpMessage = 'The file path(s).')]
         [ValidateScript({
                 if (!$PSItem -or $PSItem.Count -lt 1) { throw [System.ArgumentException]::new('"Path" needs to have at least one file path.') }
                 return $true
             })]
         [string[]]$Path,
 
-        [Parameter(Position = 1)]
+        [Parameter(
+            Position = 1,
+            HelpMessage = 'The path to store the downloaded symbols')]
         [ValidateNotNullOrEmpty()]
         [string]$DestinationStore = 'C:\Symbols',
 
-        [Parameter()]
+        [Parameter(HelpMessage = 'The timeout, in seconds, for the bynary read operation.')]
         [ValidateRange(0, [int]::MaxValue)]
         [int]$ReadTimeout = 60,
 
-        [Parameter()]
+        [Parameter(
+            HelpMessage = 'The timeoout, in seconds, for the download operation.')]
         [ValidateRange(0, [int]::MaxValue)]
         [int]$DownloadTimeout = 15,
 
-        [Parameter()]
+        [Parameter(
+            HelpMessage = 'The number of retries for timed out downloads.')]
         [ValidateRange(0, [int]::MaxValue)]
         [int]$Retry = 3
     )
@@ -677,7 +704,7 @@ function Get-PdbSymbol {
                     $stopwatch = [System.Diagnostics.Stopwatch]::new()
                     $stopwatch.Start()
                     while ($syncedObjects.CbDebug -ge [System.Runtime.InteropServices.Marshal]::SizeOf([type]$IMAGE_DEBUG_DIRECTORY)) {
-                        if ($stopwatch.Elapsed.Seconds -ge $syncedObjects.Timeout) {
+                        if ($syncedObjects.Timeout -gt 0 -and $stopwatch.Elapsed.Seconds -ge $syncedObjects.Timeout) {
                             break
                         }
                         if (!$syncedObjects.Success) {
