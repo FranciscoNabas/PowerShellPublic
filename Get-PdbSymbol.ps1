@@ -50,8 +50,8 @@
     .NOTES
 
         This script is provided under the MIT license.
-        Version: 1.3.0
-        Release date: 09-APR-2023
+        Version: 1.3.1
+        Release date: 13-JUN-2023
         Author: Francisco Nabas
 
     .LINK
@@ -416,12 +416,12 @@ function Get-PdbSymbol {
 
                     $sync.IsComplete = $true
                     [void]$cacheObject.Add("$OriginFileName;$([System.IO.Path]::GetFileName($TargetFile));OK")
-                    [void]$existingFilenames.Add($OriginFileName)
+                    [void]$Global:existingFilenames.Add($OriginFileName)
                 }
                 catch {
                     if ($PSItem.Exception.Message -like '*404*Not*Found*') {
                         [void]$cacheObject.Add("$OriginFileName;$([System.IO.Path]::GetFileName($TargetFile));NotFound")
-                        [void]$existingFilenames.Add($OriginFileName)
+                        [void]$Global:existingFilenames.Add($OriginFileName)
                     }
                     else {
                         [void]$cacheObject.Add("$OriginFileName;$([System.IO.Path]::GetFileName($TargetFile));$($PSItem.Exception.Message)")
@@ -565,7 +565,12 @@ function Get-PdbSymbol {
 
     Process {
         
+        if (!(Test-Path -Path $DestinationStore -PathType Container)) {
+            [void](New-Item -Path $DestinationStore -ItemType Directory)
+        }
+
         ## Creating cache file with header.
+        [System.Collections.Generic.HashSet[string]]$Global:existingFilenames = @()
         if (!(Test-Path -Path "$DestinationStore\.DownloadStatusCache.log" -PathType Leaf)) {
             'OriginFile;SymbolFile;DownloadStatus' | Out-File -FilePath "$DestinationStore\.DownloadStatusCache.log"
         }
@@ -582,10 +587,12 @@ function Get-PdbSymbol {
             Write-Progress -Id 0 -Activity 'Get PDB Symbol' -Status "Processed files: $processedFileCount/$($Path.Count). $fileName" -PercentComplete (($processedFileCount / $Path.Count) * 100)
 
             ## Skipping already existing files, or previous failed downloads.
-            if ($Global:existingFilenames.Contains($fileName)) {
-                Write-Progress -Id 0 -Activity 'Get PDB Symbol' -Status "Processed files: $processedFileCount/$($Path.Count). $fileName" -PercentComplete (($processedFileCount / $Path.Count) * 100)
-                $processedFileCount++
-                continue
+            if ($Global:existingFilenames) {
+                if ($Global:existingFilenames.Contains($fileName)) {
+                    Write-Progress -Id 0 -Activity 'Get PDB Symbol' -Status "Processed files: $processedFileCount/$($Path.Count). $fileName" -PercentComplete (($processedFileCount / $Path.Count) * 100)
+                    $processedFileCount++
+                    continue
+                }
             }
     
             ## Loading file in memory, and creating the BinaryReader.
@@ -788,7 +795,7 @@ function Get-PdbSymbol {
             }
             else {
                 [void]$cacheObject.Add("$fileName;NoDebugInfo;NoDebugInfo")
-                [void]$existingFilenames.Add($OriginFileName)
+                [void]$Global:existingFilenames.Add($OriginFileName)
             }
 
             ## Cleanup.
