@@ -213,11 +213,19 @@ function Get-DownloadAverageTimeAndSpeed {
         
                         byte[] chunk = new byte[dwBytes];
                         IntPtr buffer = Marshal.AllocHGlobal((int)dwBytes);
-                        if (!WinHttpReadData(hRequest, buffer, dwBytes, out _))
-                            throw new SystemException($"WinHttpReadData: {Marshal.GetLastWin32Error()}");
-        
-                        Marshal.Copy(buffer, chunk, 0, chunk.Length);
-                        fileStream.Write(chunk, 0, chunk.Length);
+                        try
+                        {
+                            if (!WinHttpReadData(hRequest, buffer, dwBytes, out _))
+                                throw new SystemException($"WinHttpReadData: {Marshal.GetLastWin32Error()}");
+                        
+                            Marshal.Copy(buffer, chunk, 0, chunk.Length);
+                            fileStream.Write(chunk, 0, chunk.Length);
+                        }
+                        finally
+                        {
+                            Marshal.FreeHGlobal(buffer);
+                        }
+                        
                     } while (dwBytes > 0);
         
                     WinHttpCloseHandle(hRequest);
