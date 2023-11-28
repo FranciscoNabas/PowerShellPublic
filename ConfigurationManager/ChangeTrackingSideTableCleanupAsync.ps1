@@ -38,8 +38,8 @@
     .NOTES
 
         Scripted by: Francisco Nabas.
-        Scripted on: 16-OCT-2023
-        Version: 1.0.0
+        Version: 2.0.0
+	Version date: 28-NOV-2023
         Contact: francisconabas@outlook.com
 
     .LINK
