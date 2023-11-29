@@ -737,13 +737,15 @@ SELECT @DeletedRowCount
     Write-Verbose 'Checking tables again for rows beyond retention.'
     Add-Log $Global:logPath 'Informational' 'Checking tables again for rows beyond retention.'
     try {
-        $tableList = $null
-        $tableList = Get-CTTablesWithRowsPassedRetention($Database)
+        $allCtTables = Get-CTTablesWithRowsPassedRetention($Database)
     }
     catch {
         Add-Log $Global:logPath 'Error' 'Error getting tables with rows beyond retention.'
         Add-Log $Global:logPath 'Error' $_.Exception.Message
     }
+
+    $tableList = $null
+    $tableList = $allCtTables | Where-Object { $_.RowsBeyondRetention -gt 0 }
 
     # There are still tables with rows passed retention.
     if ($tableList -and $tableList.Count -gt 0) {
@@ -765,8 +767,8 @@ SELECT @DeletedRowCount
             $command.CommandType = [System.Data.CommandType]::Text
 
             foreach ($info in $tableList) {
-                Write-Verbose "Cleaning up for table '$($info.TableName)', side table '$($info.CTTableName)'."
-                Add-Log $Global:logPath 'Informational' "Cleaning up for table '$($info.TableName)', side table '$($info.CTTableName)'."
+                Write-Verbose "Cleaning up for table '$($info.TableName)', side table '$($info.CTTableName)', CleanupTrxID: $($info.CleanupTrxID)."
+                Add-Log $Global:logPath 'Informational' "Cleaning up for table '$($info.TableName)', side table '$($info.CTTableName)', CleanupTrxID: $($info.CleanupTrxID)."
             
                 try {
                     $command.CommandText = @"
