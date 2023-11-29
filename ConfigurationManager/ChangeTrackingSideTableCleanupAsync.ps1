@@ -38,8 +38,8 @@
     .NOTES
 
         Scripted by: Francisco Nabas.
-        Version: 2.0.0
-	Version date: 28-NOV-2023
+        Version: 2.1.0
+	    Version date: 29-NOV-2023
         Contact: francisconabas@outlook.com
 
     .LINK
@@ -67,8 +67,6 @@ param (
     [ValidateRange(0, [int]::MaxValue)]
     [int]$RowsToDeletePerIteration = 10000
 )
-
-
 
 #region Functions
 # This function creates logs compatible with the CMTrace.
@@ -364,7 +362,7 @@ function Get-CTTablesWithRowsPassedRetention([string]$Database) {
     	SET @Index += 1;  
     END
 
-    SELECT * FROM ##CustomChangeTrackingData_ WHERE RowsBeyondRetention != 0 ORDER BY RowsBeyondRetention DESC
+    SELECT * FROM ##CustomChangeTrackingData_ ORDER BY RowsBeyondRetention DESC
     DROP TABLE ##CustomChangeTrackingData_
 '@
 
@@ -383,29 +381,30 @@ function Get-CTTablesWithRowsPassedRetention([string]$Database) {
             $listingReader = $listingCommand.ExecuteReader()
             while ($listingReader.Read()) {
                 [void]$tableList.Add([PSCustomObject]@{
-                    ID = $listingReader[0]
-                    TableName = $listingReader[1]
-                    CTTableName = $listingReader[2]
-                    ObjectID = $listingReader[3]
-                    CTRowCount = $listingReader[4]
-                    MinXdesID = $listingReader[5]
-                    MinTime = $listingReader[6]
-                    DaysOld = $listingReader[7]
-                    RowsBeyondRetention = $listingReader[8]
-                    AllRowsBeyondRetention = $listingReader[9]
-                    NumRowsOrphaned = $listingReader[10]
-                    NumRowsDeleted = $listingReader[11]
-                    ErrorCount = $listingReader[12]
-                    ErrorNumber = $listingReader[13]
-                    CleanupTrxID = $listingReader[14]
-                    CleanupVersion = $listingReader[15]
-                })
+                        ID                     = $listingReader[0]
+                        TableName              = $listingReader[1]
+                        CTTableName            = $listingReader[2]
+                        ObjectID               = $listingReader[3]
+                        CTRowCount             = $listingReader[4]
+                        MinXdesID              = $listingReader[5]
+                        MinTime                = $listingReader[6]
+                        DaysOld                = $listingReader[7]
+                        RowsBeyondRetention    = $listingReader[8]
+                        AllRowsBeyondRetention = $listingReader[9]
+                        NumRowsOrphaned        = $listingReader[10]
+                        NumRowsDeleted         = $listingReader[11]
+                        ErrorCount             = $listingReader[12]
+                        ErrorNumber            = $listingReader[13]
+                        CleanupTrxID           = $listingReader[14]
+                        CleanupVersion         = $listingReader[15]
+                    })
             }
         }
         catch {
             throw $_
         }
         finally {
+            $listingCommand.Cancel()
             $listingReader.Dispose()
         }
     }
@@ -413,10 +412,7 @@ function Get-CTTablesWithRowsPassedRetention([string]$Database) {
         throw $_
     }
     finally {
-        # Either Close() or Dispose() is enough. I'm paranoid.
-        $connection.Close()
         $connection.Dispose()
-        $connection = $null
     }
 
     return $tableList
@@ -431,10 +427,10 @@ Add-Log $Global:logPath 'Informational' '#################### ~ Starting new exe
 Add-Log $Global:logPath 'Informational' 'Getting tables that have rows beyond retention.'
 Write-Verbose 'Getting tables that have rows beyond retention.'
 try {
-    $tableList = Get-CTTablesWithRowsPassedRetention($Database)
+    $allCtTables = Get-CTTablesWithRowsPassedRetention($Database)
 
     # This value is used to cleanup the 'sys.syscommittab'.
-    $Global:cleanupVersion = ($tableList | Select-Object -First 1).CleanupVersion
+    $Global:cleanupVersion = ($allCtTables | Select-Object -First 1).CleanupVersion
 }
 catch {
     Add-Log $Global:logPath 'Error' 'Error getting tables with rows beyond retention.'
@@ -442,15 +438,72 @@ catch {
     throw $_
 }
 
+# sys.syscommittab cleanup script
+Add-Log $Global:logPath 'Informational' "Cleanup version: $Global:cleanupVersion."
+Write-Verbose "Cleanup version: $Global:cleanupVersion."
+$syscommittabCleanupScript = @"
+SET NOCOUNT OFF
+
+DECLARE @RowsDeleted BIGINT = 0;
+DECLARE @TotalRowsDeleted BIGINT = 0;
+DECLARE @ErrorCount INT = 0;
+DECLARE @RetryCount INT = 10;
+
+WHILE (1 = 1)
+BEGIN
+    SYSCOMMIT_CLEANUP_RETRY:
+    BEGIN TRY
+        DELETE TOP ($RowsToDeletePerIteration)
+        FROM sys.syscommittab
+        WHERE commit_ts <= $Global:cleanupVersion;
+
+        SET @RowsDeleted = @@ROWCOUNT;
+        SET @TotalRowsDeleted += @RowsDeleted;
+        IF (@RowsDeleted < $RowsToDeletePerIteration)
+        BEGIN
+            SELECT @TotalRowsDeleted, 'Info';
+            BREAK;
+        END
+    END TRY
+    BEGIN CATCH
+        -- 1205 is deadlock. Retry until the max retry count.
+        IF (ERROR_NUMBER() = 1205)
+        BEGIN
+            SET @ErrorCount += 1;
+            IF (@ErrorCount < @RetryCount)
+            BEGIN
+                WAITFOR DELAY '00:00:01'
+                GOTO SYSCOMMIT_CLEANUP_RETRY;
+            END
+            ELSE
+            BEGIN
+                SELECT 'Maximum error count reached.', 'Error';
+                BREAK;
+            END
+        END
+        ELSE
+        BEGIN
+            -- Unexpected error occurred. We output and bail.
+            SELECT ERROR_MESSAGE(), 'Error';
+            BREAK;
+        END
+    END CATCH
+END
+"@
+
+# Getting only tables that have rows passed the retention period.
+$tableList = $allCtTables | Where-Object { $_.RowsBeyondRetention -gt 0 }
 $currentTableCount = $tableList.Count
 if (!$currentTableCount) { $currentTableCount = 0 }
-Add-Log $Global:logPath 'Informational' "Starting table count: $currentTableCount."
-Write-Verbose "Starting table count: $currentTableCount."
 
-# Creating Runspace pool.
-Add-Log $Global:logPath 'Informational' 'Creating Runspace pool.'
-Write-Verbose 'Creating Runspace pool.'
 if ($currentTableCount -gt 0) {
+    Add-Log $Global:logPath 'Informational' "Starting table count: $currentTableCount."
+    Write-Verbose "Starting table count: $currentTableCount."
+
+    # Creating Runspace pool.
+    Add-Log $Global:logPath 'Informational' 'Creating Runspace pool.'
+    Write-Verbose 'Creating Runspace pool.'
+
     if ($MaxConcurrentTask -gt 0) {
         $Global:pool = [runspacefactory]::CreateRunspacePool(1, $MaxConcurrentTask)    
     }
@@ -465,53 +518,110 @@ if ($currentTableCount -gt 0) {
     # In order for this to work in a MTA apartment our script cannot produce any output, because
     # you cannot call 'Write*' from outside the 'BeginProcessing', 'ProcessRecord', and 'EndProcessing'
     # overloads, or threads other than the main one.
-    # So to catch errors we'll use a synchronized hashtable, which is thread safe.
-    $errorLog = [hashtable]::Synchronized(@{ Log = [System.Collections.Generic.Dictionary[string, string]]::new() })
+    # So to catch errors, and exchange information we'll use a synchronized hashtable, which is thread safe.
+    $infoStream = [hashtable]::Synchronized(@{ Log = [System.Collections.Generic.Dictionary[string, Tuple[string, bool]]]::new() })
 
     # The task list 
     $taskList = [System.Collections.Generic.Dictionary[string, powershell]]::new()
     
     # Creating the tasks.
+    
+    # Connection string that will be used by the tasks. This allows us to set a pool size big enough
+    # to acomodate all tasks.
+    $connectionString = "Server=localhost; Database=$Database; Trusted_Connection=True; Connect Timeout=60; Max Pool Size=$currentTableCount"
+
     foreach ($tableInfo in $tableList) {
         $currentTask = [powershell]::Create()
         $currentTask.RunspacePool = $Global:pool
         
         # The script that will run on each task.
         [void]$currentTask.AddScript({
-            param(
-                [string]$TableName,
-                [string]$Database,
-                [hashtable]$ErrorLog
-            )
+                param(
+                    [string]$TableName,
+                    [string]$ConnectionString,
+                    [hashtable]$InformationStream
+                )
 
-            # No output.
-            $ErrorActionPreference = 'Stop'
-            $WarningPreference = 'SilentlyContinue'
-            $VerbosePreference = 'SilentlyContinue'
-            $ProgressPreference = 'SilentlyContinue'
-            $InformationPreference = 'SilentlyContinue'
-    
-            $invokeSqlSplat = @{
-                ServerInstance    = 'localhost'
-                Database          = $Database
-                Query             = "exec sys.sp_flush_CT_internal_table_on_demand @TableToClean = '$TableName'"
-                ConnectionTimeout = 60
-                QueryTimeout      = 65000
-            }
+                try {
+                    $query = @"
+SET NOCOUNT OFF
+DECLARE @DeletedRowCount BIGINT;
 
-            try {
-                [void](Invoke-Sqlcmd @invokeSqlSplat)
-            }
-            catch {
-                [void]$ErrorLog.Log.Add($TableName, $_.Exception.Message)
-            }
+exec sys.sp_flush_CT_internal_table_on_demand '$TableName', @DeletedRowCount = @DeletedRowCount OUTPUT;
+
+SELECT @DeletedRowCount
+"@
+                    
+                    $connection = [System.Data.SqlClient.SqlConnection]::new($ConnectionString)
+                    $connection.Open()
+
+                    $command = [System.Data.SqlClient.SqlCommand]::new($query, $connection)
+                    $command.CommandTimeout = 82800
+                    $result = $command.ExecuteScalar()
+
+                    [void]$InformationStream.Log.Add($TableName, [Tuple[string, bool]]::new("Rows deleted: $result", $false))    
+                }
+                catch {
+                    [void]$InformationStream.Log.Add($TableName, [Tuple[string, bool]]::new($_.Exception.Message, $true))
+                }
+                finally {
+                    $command.Cancel()
+                    $connection.Dispose()
+                }
     
-        }).AddParameter('TableName', $tableInfo.TableName).AddParameter('Database', $Database).AddParameter('ErrorLog', $errorLog)
+            }).AddParameter('TableName', $tableInfo.TableName).AddParameter('ConnectionString', $connectionString).AddParameter('InformationStream', $infoStream)
 
         # Starting the PS instance asynchronously, and saving it on the task list.
         [void]$currentTask.BeginInvoke()
         [void]$taskList.Add($tableInfo.TableName, $currentTask)
     }
+
+    # Creating the 'sys.syscommittab' cleanup task.
+    Add-Log $Global:logPath 'Informational' "Creating the 'sys.syscommittab' cleanup task."
+    Write-Verbose "Creating the 'sys.syscommittab' cleanup task."
+
+    $syscommittabTask = [powershell]::Create()
+    $syscommittabTask.RunspacePool = $Global:pool
+    [void]$syscommittabTask.AddScript({
+
+            param(
+                [string]$Query,
+                [string]$Database,
+                [hashtable]$InformationStream
+            )
+
+            try {
+                # Creating a DAC connection and command.
+                $connection = [System.Data.SqlClient.SqlConnection]::new("Server=admin:localhost; Database=$Database; Trusted_Connection=True; Connect Timeout=60")
+                $connection.Open()
+    
+                $command = [System.Data.SqlClient.SqlCommand]::new($Query, $connection)
+                $command.CommandTimeout = 82800
+    
+                # Executing the cleanup and collecting the result.
+                $reader = $command.ExecuteReader()
+                if ($reader.Read()) {
+                    $message = $reader[0]
+                    if ($reader[1] -eq 'Error') {
+                        [void]$InformationStream.Log.Add('syscommittab', [Tuple[string, bool]]::new($message, $true))
+                    }
+                    else {
+                        [void]$InformationStream.Log.Add('syscommittab', [Tuple[string, bool]]::new("Rows deleted: $message", $false))
+                    }
+                }
+            }
+            catch {
+                [void]$InformationStream.Log.Add('syscommittab', [Tuple[string, bool]]::new($_.Exception.Message, $true))
+            }
+            finally {
+                $reader.Dispose()
+                $command.Cancel()
+                $connection.Dispose()
+            }
+        }).AddParameter('Query', $syscommittabCleanupScript).AddParameter('Database', $Database).AddParameter('InformationStream', $infoStream)
+
+    [void]$syscommittabTask.BeginInvoke()
+    [void]$taskList.Add('syscommittab', $syscommittabTask)
 
     # Entering the monitoring loop.
     Add-Log $Global:logPath 'Informational' 'Entering the monitoring loop.'
@@ -520,7 +630,6 @@ if ($currentTableCount -gt 0) {
     $failedTables = [System.Collections.Generic.Dictionary[string, int]]::new()
     [System.Collections.Generic.HashSet[string]]$completedTaskNames = @()
     do {
-    
         $completed = $true
         $runningTaskCount = 0
         foreach ($task in $taskList.Keys) {
@@ -532,46 +641,61 @@ if ($currentTableCount -gt 0) {
             }
             else {
                 # Checking if the task has errors.
-                $possibleException = [string]::Empty
-                if ($errorLog.Log.TryGetValue($task, [ref]$possibleException)) {
-                    $retryCount = $null
-                    if ($failedTables.TryGetValue($task, [ref]$retryCount)) {
-                        if ($retryCount -lt $MaxRetryCount) {
-
-                            # Trying again.
-                            Add-Log $Global:logPath 'Error' "Task for table '$($task)' failed with '$($possibleException)'. Trying again. Retries left: $($MaxRetryCount - $failedTables[$task])."
-                            Write-Warning "Task for table '$($task)' failed with '$($possibleException)'. Trying again. Retries left: $($MaxRetryCount - $failedTables[$task])."
-                        
-                            $failedTables[$task]++
-                            [void]$taskList[$task].BeginInvoke()
-                        }
-                        else {
-                            # The retry count exceeds the max. Terminating this task.
-                            if (!$completedTaskNames.Contains($task)) {
-                                Add-Log $Global:logPath 'Informational' "Task for table '$($task)' ended."
-                                Write-Verbose "Task for table '$($task)' ended."
+                $singleInfo = $null
+                if ($infoStream.Log.TryGetValue($task, [ref]$singleInfo)) {
+                    
+                    # It's an error.
+                    if ($singleInfo.Item2) {
+                        $retryCount = $null
+                        if ($failedTables.TryGetValue($task, [ref]$retryCount)) {
+                            if ($retryCount -lt $MaxRetryCount) {
+    
+                                # Trying again.
+                                Add-Log $Global:logPath 'Error' "Task for table '$($task)' failed with '$($singleInfo.Item1)'. Trying again. Retries left: $($MaxRetryCount - $failedTables[$task])."
+                                Write-Warning "Task for table '$($task)' failed with '$($singleInfo.Item1)'. Trying again. Retries left: $($MaxRetryCount - $failedTables[$task])."
+                            
+                                $failedTables[$task]++
+                                [void]$taskList[$task].BeginInvoke()
                             }
-
-                            [void]$completedTaskNames.Add($task)
-                            $taskList[$task].Dispose()
+                            else {
+                                # The retry count exceeds the max. Terminating this task.
+                                if (!$completedTaskNames.Contains($task)) {
+                                    Add-Log $Global:logPath 'Error' "Task for table '$($task)' ended with failure. Max retries exceeded."
+                                    Write-Verbose "Task for table '$($task)' ended with failure. Max retries exceeded."
+                                }
+    
+                                [void]$completedTaskNames.Add($task)
+                                $taskList[$task].Dispose()
+                            }
+                        }
+                        # First retry.
+                        else {
+                            if ($MaxRetryCount -gt 0) {
+    
+                                # Trying again.
+                                Add-Log $Global:logPath 'Error' "Task for table '$($task)' failed with '$($singleInfo.Item1)'. Trying again. Retries left: $($MaxRetryCount - $failedTables[$task])."
+                                Write-Warning "Task for table '$($task)' failed with '$($singleInfo.Item1)'. Trying again. Retries left: $($MaxRetryCount - $failedTables[$task])."
+    
+                                $failedTables.Add($task, 1)
+                                [void]$taskList[$task].BeginInvoke()
+                            }
+                            else {
+                                # No retry. Terminating this task.
+                                if (!$completedTaskNames.Contains($task)) {
+                                    Add-Log $Global:logPath 'Error' "Task for table '$($task)' ended with failure. Max retries exceeded."
+                                    Write-Verbose "Task for table '$($task)' ended with failure. Max retries exceeded."
+                                }
+    
+                                [void]$completedTaskNames.Add($task)
+                                $taskList[$task].Dispose()
+                            }
                         }
                     }
+                    # It's information. 
                     else {
-                        if ($MaxRetryCount -gt 0) {
-
-                            # Trying again.
-                            Add-Log $Global:logPath 'Error' "Task for table '$($task)' failed with '$($possibleException)'. Trying again. Retries left: $($MaxRetryCount - $failedTables[$task])."
-                            Write-Warning "Task for table '$($task)' failed with '$($possibleException)'. Trying again. Retries left: $($MaxRetryCount - $failedTables[$task])."
-
-                            $failedTables.Add($task, 1)
-                            [void]$taskList[$task].BeginInvoke()
-                        }
-                        else {
-                            # No retry. Terminating this task.
-                            if (!$completedTaskNames.Contains($task)) {
-                                Add-Log $Global:logPath 'Informational' "Task for table '$($task)' ended."
-                                Write-Verbose "Task for table '$($task)' ended."
-                            }
+                        if (!$completedTaskNames.Contains($task)) {
+                            Add-Log $Global:logPath 'Informational' "Task for table '$($task)' ended: '$($singleInfo.Item1)'."
+                            Write-Verbose "Task for table '$($task)' ended: '$($singleInfo.Item1)'."
 
                             [void]$completedTaskNames.Add($task)
                             $taskList[$task].Dispose()
@@ -583,10 +707,10 @@ if ($currentTableCount -gt 0) {
                     if (!$completedTaskNames.Contains($task)) {
                         Add-Log $Global:logPath 'Informational' "Task for table '$($task)' ended."
                         Write-Verbose "Task for table '$($task)' ended."
-                    }
 
-                    [void]$completedTaskNames.Add($task)
-                    $taskList[$task].Dispose()
+                        [void]$completedTaskNames.Add($task)
+                        $taskList[$task].Dispose()
+                    }
                 }
             }
         }
@@ -608,48 +732,48 @@ if ($currentTableCount -gt 0) {
 
     Write-Verbose 'No more running tasks.'
     Add-Log $Global:logPath 'Informational' 'No more running tasks.'
-}
 
-# Checking again if there are tables still with rows passed retention.
-Write-Verbose 'Checking tables again for rows beyond retention.'
-Add-Log $Global:logPath 'Informational' 'Checking tables again for rows beyond retention.'
-try {
-    $tableList = $null
-    $tableList = Get-CTTablesWithRowsPassedRetention($Database)
-}
-catch {
-    Add-Log $Global:logPath 'Error' 'Error getting tables with rows beyond retention.'
-    Add-Log $Global:logPath 'Error' $_.Exception.Message
-}
-
-# There are still tables with rows passed retention.
-if ($tableList -and $tableList.Count -gt 0) {
-    Write-Verbose "There are still $($tableList.Count) tables with rows beyond retention. Starting individual cleanup."
-    Add-Log $Global:logPath 'Informational' "There are still $($tableList.Count) tables with rows beyond retention. Starting individual cleanup."
-
-    # Ordering to start with the one with less rows beyond retention.
-    $tableList = $tableList | Sort-Object -Property 'RowsBeyondRetention'
+    # Checking again if there are tables still with rows passed retention.
+    Write-Verbose 'Checking tables again for rows beyond retention.'
+    Add-Log $Global:logPath 'Informational' 'Checking tables again for rows beyond retention.'
     try {
+        $tableList = $null
+        $tableList = Get-CTTablesWithRowsPassedRetention($Database)
+    }
+    catch {
+        Add-Log $Global:logPath 'Error' 'Error getting tables with rows beyond retention.'
+        Add-Log $Global:logPath 'Error' $_.Exception.Message
+    }
 
-        # Creating a single DAC connection since we're cleaning tables individually.
-        $connection = [System.Data.SqlClient.SqlConnection]::new("Server=admin:localhost; Database=$Database; Trusted_Connection=True; Connect Timeout=60")
-        $connection.Open()
+    # There are still tables with rows passed retention.
+    if ($tableList -and $tableList.Count -gt 0) {
+        Write-Verbose "There are still $($tableList.Count) tables with rows beyond retention. Starting individual cleanup."
+        Add-Log $Global:logPath 'Informational' "There are still $($tableList.Count) tables with rows beyond retention. Starting individual cleanup."
 
-        # We're also using a single command. We change the command text for each table.
-        $command = [System.Data.SqlClient.SqlCommand]::new()
-        $command.Connection = $connection
-        $command.CommandTimeout = 82800
-        $command.CommandType = [System.Data.CommandType]::Text
+        # Ordering to start with the one with less rows beyond retention.
+        $tableList = $tableList | Sort-Object -Property 'RowsBeyondRetention'
+        try {
 
-        foreach ($info in $tableList) {
-            Write-Verbose "Cleaning up for table '$($info.TableName)', side table '$($info.CTTableName)'."
-            Add-Log $Global:logPath 'Informational' "Cleaning up for table '$($info.TableName)', side table '$($info.CTTableName)'."
+            # Creating a single DAC connection since we're cleaning tables individually.
+            $connection = [System.Data.SqlClient.SqlConnection]::new("Server=admin:localhost; Database=$Database; Trusted_Connection=True; Connect Timeout=60")
+            $connection.Open()
+
+            # We're also using a single command. We change the command text for each table.
+            $command = [System.Data.SqlClient.SqlCommand]::new()
+            $command.Connection = $connection
+            $command.CommandTimeout = 82800
+            $command.CommandType = [System.Data.CommandType]::Text
+
+            foreach ($info in $tableList) {
+                Write-Verbose "Cleaning up for table '$($info.TableName)', side table '$($info.CTTableName)'."
+                Add-Log $Global:logPath 'Informational' "Cleaning up for table '$($info.TableName)', side table '$($info.CTTableName)'."
             
-            try {
-                $command.CommandText = @"
+                try {
+                    $command.CommandText = @"
 DECLARE @SQL NVARCHAR(MAX);
 
 DECLARE @RowsDeleted BIGINT = 0;
+DECLARE @TotalRowsDeleted BIGINT = 0;
 DECLARE @ErrorCount INT = 0;
 DECLARE @ErrorNumber INT = 0;
 DECLARE @RetryCount INT = 10;
@@ -663,8 +787,12 @@ BEGIN
     BEGIN TRY
         EXEC sp_executesql @SQL;
         SET @RowsDeleted = @@ROWCOUNT;
+        SET @TotalRowsDeleted += @RowsDeleted;
         IF (@RowsDeleted < $RowsToDeletePerIteration)
+        BEGIN
+            SELECT @TotalRowsDeleted, 'Info';
             BREAK;
+        END
     END TRY
     BEGIN CATCH
         -- 1205 is deadlock. Retry until the max retry count.
@@ -678,116 +806,102 @@ BEGIN
             END
             ELSE
             BEGIN
-                SELECT 'Maximum error count reached.';
+                SELECT 'Maximum error count reached.', 'Error';
                 BREAK;
             END
         END
         ELSE
         BEGIN
             -- Unexpected error occurred. We output and bail.
-            SELECT ERROR_MESSAGE();
+            SELECT ERROR_MESSAGE(), 'Error';
             BREAK;
         END
     END CATCH
 END
 "@
 
-                [void]$command.ExecuteNonQuery()
+                    $reader = $command.ExecuteReader()
+                    if ($reader.Read()) {
+                        $message = $reader[0]
+                        if ($reader[1] -eq 'Error') {
+                            Add-Log $Global:logPath 'Error' "Error cleaning up table '$($info.TableName)', side table '$($info.CTTableName)'."
+                            Add-Log $Global:logPath 'Error' $message
+                        }
+                        else {
+                            Write-Verbose "Finished cleaning up for '$($info.TableName)'. Rows deleted: $message."
+                            Add-Log $Global:logPath 'Informational' "Finished cleaning up for '$($info.TableName)'. Rows deleted: $message."
+                        }
+                    }
+                }
+                catch {
+                    Add-Log $Global:logPath 'Error' "Error cleaning up table '$($info.TableName)', side table '$($info.CTTableName)'."
+                    Add-Log $Global:logPath 'Error' $_.Exception.Message
+                }
+                finally {
+                    $reader.Dispose()
+                }
             }
-            catch {
-                Add-Log $Global:logPath 'Error' "Error cleaning up table '$($info.TableName)', side table '$($info.CTTableName)'."
-                Add-Log $Global:logPath 'Error' $_.Exception.Message
+        }
+        catch {
+            Add-Log $Global:logPath 'Error' 'Error cleaning up individual tables.'
+            Add-Log $Global:logPath 'Error' $_.Exception.Message
+        }
+        finally {
+            $command.Cancel()
+            $connection.Dispose()
+        }
+
+        Write-Verbose 'Finished individual table cleanup.'
+        Add-Log $Global:logPath 'Informational' 'Finished individual table cleanup.'
+    }
+    else {
+        Write-Verbose 'No more tables with row passed retention.'
+        Add-Log $Global:logPath 'Informational' 'No more tables with row passed retention.'
+    }
+
+    Write-Verbose 'Disposing of resources.'
+    try { $Global:pool.Dispose() }
+    catch { }
+}
+else {
+    Write-Verbose 'There are no tables with rows passed the retention period.'
+    Add-Log $Global:logPath 'Informational' 'There are no tables with rows passed the retention period.'
+
+    # sys.syscommittab cleanup.
+    Write-Verbose "Starting the 'syscommittab' table cleanup."
+    Add-Log $Global:logPath 'Informational' "Starting the 'syscommittab' table cleanup."
+    try {
+        # Creating a DAC connection and command.
+        $connection = [System.Data.SqlClient.SqlConnection]::new("Server=admin:localhost; Database=$Database; Trusted_Connection=True; Connect Timeout=60")
+        $connection.Open()
+
+        $command = [System.Data.SqlClient.SqlCommand]::new($syscommittabCleanupScript, $connection)
+        $command.CommandTimeout = 82800
+
+        # Executing the cleanup.
+        $reader = $command.ExecuteReader()
+        if ($reader.Read()) {
+            $message = $reader[0]
+            if ($reader[1] -eq 'Error') {
+                Add-Log $Global:logPath 'Error' "Error cleaning up table 'syscommittab'."
+                Add-Log $Global:logPath 'Error' $message
+            }
+            else {
+                Write-Verbose "Finished cleaning up of 'syscommittab'. Rows deleted: $message."
+                Add-Log $Global:logPath 'Informational' "Finished cleaning up of 'syscommittab'. Rows deleted: $message."
             }
         }
     }
     catch {
-        Add-Log $Global:logPath 'Error' 'Error cleaning up individual tables.'
+        Add-Log $Global:logPath 'Error' "Error cleaning up the 'syscommittab' table."
         Add-Log $Global:logPath 'Error' $_.Exception.Message
     }
     finally {
-        $connection.Close()
+        $reader.Dispose()
+        $command.Cancel()
         $connection.Dispose()
-        $connection = $null
     }
-
-    Write-Verbose 'Finished individual table cleanup.'
-    Add-Log $Global:logPath 'Informational' 'Finished individual table cleanup.'
 }
-else {
-    Write-Verbose 'No more tables with row passed retention.'
-    Add-Log $Global:logPath 'Informational' 'No more tables with row passed retention.'
-}
-
-# Cleanup sys.syscommittab
-Add-Log $Global:logPath 'Informational' 'Starting syscommit table cleanup.'
-Write-Verbose 'Starting syscommit table cleanup.'
-
-$syscommitQuery = @"
-DECLARE @RowsDeleted BIGINT = 0;
-DECLARE @ErrorCount INT = 0;
-DECLARE @RetryCount INT = 10;
-
-WHILE (1 = 1)
-BEGIN
-    SYSCOMMIT_CLEANUP_RETRY:
-    BEGIN TRY
-        DELETE TOP ($RowsToDeletePerIteration)
-        FROM sys.syscommittab
-        WHERE commit_ts <= $($Global:cleanupVersion);
-
-        SET @RowsDeleted = @@ROWCOUNT;
-        IF (@RowsDeleted < $RowsToDeletePerIteration)
-            BREAK;
-    END TRY
-    BEGIN CATCH
-        -- 1205 is deadlock. Retry until the max retry count.
-        IF (ERROR_NUMBER() = 1205)
-        BEGIN
-            SET @ErrorCount += 1;
-            IF (@ErrorCount < @RetryCount)
-            BEGIN
-                WAITFOR DELAY '00:00:01'
-                GOTO SYSCOMMIT_CLEANUP_RETRY;
-            END
-            ELSE
-            BEGIN
-                SELECT 'Maximum error count reached.';
-                BREAK;
-            END
-        END
-        ELSE
-        BEGIN
-            -- Unexpected error occurred. We output and bail.
-            SELECT ERROR_MESSAGE();
-            BREAK;
-        END
-    END CATCH
-END
-"@
-
-try {
-    # Creating a DAC connection and command.
-    $connection = [System.Data.SqlClient.SqlConnection]::new("Server=admin:localhost; Database=$Database; Trusted_Connection=True; Connect Timeout=60")
-    $connection.Open()
-
-    $command = [System.Data.SqlClient.SqlCommand]::new($syscommitQuery, $connection)
-
-    # Executing the cleanup.
-    [void]$command.ExecuteNonQuery()
-}
-catch {
-    Add-Log $Global:logPath 'Error' 'Error cleaning up syscommittab.'
-    Add-Log $Global:logPath 'Error' $_.Exception.Message
-}
-finally {
-    $connection.Close()
-    $connection.Dispose()
-    $connection = $null
-}
-
-Write-Verbose 'Disposing of resources.'
-try { $Global:pool.Dispose() }
-catch { }
 
 Add-Log $Global:logPath 'Informational' 'End of execution.'
 Write-Verbose 'End of execution.'
