@@ -1,5 +1,5 @@
 <#PSScriptInfo
-.VERSION 1.0.0
+.VERSION 1.0.1
 
 .GUID dcb430bf-7683-41f0-a17d-d64fabd18e6e
 
@@ -12,32 +12,39 @@
 .LICENSEURI https://github.com/FranciscoNabas/PowerShellPublic/blob/main/LICENSE
 
 .PROJECTURI https://github.com/FranciscoNabas/PowerShellPublic
-#>
 
-#Requires -RunAsAdministrator
+.RELEASENOTES
+Version 1.0.1:
+    - Native array enumeration optimization.
+    - Consolidated folder and file delete in single method.
+    - Fixed bug on progress data.
+    - Fixed bug on closed handle warning.
+    - New monitoring mechanism.
+    - Changes on the C# code to conform to C# 5, because Windows PowerShell thinks it's 2012.
+Version 1.0.0:
+    - Initial version published.
+#>
 
 <#
 .SYNOPSIS
 
-    Obliterates one or more directories.
+    Obliterates one or more files or folders recursively and in parallel.
 
 .DESCRIPTION
 
-    This function deletes one or more directories recursively, including its files and sub-directories.
+    This function deletes one or more files or folders recursively, including its files and sub-directories.
+    It was also designed to accept input from the pipeline, from Cmdlets like 'Get-ChildItem'.
     If one of the file system objects are open in another process it attempts to close the handles.
-    It was designed to be fast, so we had to use partially undocumented Windows APIs and .NET asynchronous primitives.
-    For this reason all logic, except the monitoring, was written in C#. That's why the huge signature.
     The closing handle mechanism was ported from the 'WindowsUtils' module.
 
     ATTENTION!!!
 
     This function deletes files and potentially closes open handles without prompting for confirmation!
-    It was designed to be like that, simple, fast, and deadly.
+    It was designed to be like that.
     Closing other processe's handles to a file system object may cause system malfunction. Use it with care!
 
     About privileges:
-    This function requires to be ran as administrator, because it needs access to delete files potentially in protected places.
-    The main API enables the 'SeBackupPrivilege' and 'SeRestorePrivilege' for the executing process token during execution to make sure we have the right permissions.
+    The main API tries to enable the 'SeBackupPrivilege' and 'SeRestorePrivilege' for the executing process token during execution to make sure we have the right permissions.
     These privileges are disabled once the method ends.
 
     About cancellation:
@@ -83,8 +90,8 @@
 
     Scripted by: Francisco Nabas
     Scripted on: 2024-10-09
-    Version: 1.0.0
-    Version date: 2024-10-09
+    Version: 1.0.1
+    Version date: 2024-10-12
 
 .LINK
 
@@ -142,18 +149,12 @@ namespace Utilities
         internal string String { get { return Marshal.PtrToStringUni(Buffer, Length / 2); } }
     }
 
-    [StructLayout(LayoutKind.Sequential)]
+    [StructLayout(LayoutKind.Explicit)]
     internal struct IO_STATUS_BLOCK
     {
-        internal IO_STATUS_BLOCK_Union Union;
-        internal IntPtr Information;
-
-        [StructLayout(LayoutKind.Explicit)]
-        internal struct IO_STATUS_BLOCK_Union
-        {
-            [FieldOffset(0)] internal int Status;
-            [FieldOffset(0)] internal IntPtr Pointer;
-        }
+        [FieldOffset(0)] internal int Status;
+        [FieldOffset(0)] internal IntPtr Pointer;
+        [FieldOffset(8)] internal IntPtr Information;
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -186,21 +187,7 @@ namespace Utilities
     internal struct FILE_PROCESS_IDS_USING_FILE_INFORMATION
     {
         internal uint NumberOfProcessIdsInList;
-        private UIntPtr _processIdList;
-
-        internal int[] ProcessIdList { get { return GetProcessIdList(); } }
-
-        private unsafe int[] GetProcessIdList()
-        {
-            int[] output = new int[NumberOfProcessIdsInList];
-            fixed (UIntPtr* listPtr = &_processIdList) {
-                for (int i = 0; i < NumberOfProcessIdsInList; i++) {
-                    output[i] = (int)listPtr[i];
-                }
-            }
-
-            return output;
-        }
+        internal UIntPtr ProcessIdList;
     }
 
     // This structure has more members, but we only care aboud the handle value.
@@ -211,25 +198,11 @@ namespace Utilities
     }
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct PROCESS_HANDLE_SNAPSHOT_INFORMATION
+    internal unsafe struct PROCESS_HANDLE_SNAPSHOT_INFORMATION
     {
         internal UIntPtr NumberOfHandles;
         internal UIntPtr Reserved;
-        private PROCESS_HANDLE_TABLE_ENTRY_INFO _handles;
-
-        public PROCESS_HANDLE_TABLE_ENTRY_INFO[] Handles { get { return GetHandleTable(); } }
-
-        private unsafe PROCESS_HANDLE_TABLE_ENTRY_INFO[] GetHandleTable()
-        {
-            PROCESS_HANDLE_TABLE_ENTRY_INFO[] output = new PROCESS_HANDLE_TABLE_ENTRY_INFO[(long)NumberOfHandles];
-            fixed (PROCESS_HANDLE_TABLE_ENTRY_INFO* tablePtr = &_handles) {
-                for (long i = 0; i < (long)NumberOfHandles; i++) {
-                    output[i] = tablePtr[i];
-                }
-            }
-
-            return output;
-        }
+        internal PROCESS_HANDLE_TABLE_ENTRY_INFO Handles;
     }
 
     // This structure has more members, but we only care aboud the type name.
@@ -281,19 +254,97 @@ namespace Utilities
         }
     }
 
+    public sealed class ObjectHandleClosedEventArgs : EventArgs
+    {
+        public string ObjectPath { get; private set; }
+        public int ProcessId { get; private set; }
+
+        internal ObjectHandleClosedEventArgs(string path, int processId)
+        {
+            this.ObjectPath = path;
+            this.ProcessId = processId;
+        }
+    }
+
+    public sealed class ObliteratorProgressData
+    {
+        private readonly object _syncObject = new object();
+        private readonly List<Tuple<string, int>> _closedHandleList = new List<Tuple<string, int>>();
+
+        private int _totalCount = 0;
+        private int _progress = 0;
+        
+        public int TotalCount {
+            get { lock (_syncObject) { return _totalCount; } }
+            internal set { lock (_syncObject) { _totalCount = value; } }
+        }
+
+        public int Progress {
+            get { lock (_syncObject) { return _progress; } }
+            internal set { lock (_syncObject) { _progress = value; } }
+        }
+
+        public Tuple<string, int>[] ClosedHandleInfo {
+            get {
+                lock (_syncObject) {
+                    return _closedHandleList.ToArray();
+                }
+            }
+            private set { }
+        }
+
+        public Tuple<int, int, Tuple<string, int>[]> RequestData()
+        {
+            lock (_syncObject) {
+                return new Tuple<int, int, Tuple<string, int>[]>(_totalCount, _progress, _closedHandleList.ToArray());
+            }
+        }
+
+        internal void Clear()
+        {
+            lock (_syncObject) {
+                _totalCount = 0;
+                _progress = 0;
+                _closedHandleList.Clear();
+            }
+        }
+
+        internal void IncrementProgress()
+        {
+            lock (_syncObject) {
+                _progress++;
+            }
+        }
+
+        internal void AddClosedHandle(string path, int processId)
+        {
+            lock (_syncObject) {
+                _closedHandleList.Add(new Tuple<string, int>(path, processId));
+            }
+        }
+    }
+
     // Main class.
     public sealed class Obliterator
     {
+        public ObliteratorProgressData ProgressData { get; private set; }
+
+        public Obliterator()
+        {
+            this.ProgressData = new ObliteratorProgressData();
+        }
+
         // Main API. Deletes files and directories recursively, closing open handles and storing progress.
-        public static DeleteFileErrorInfo[] Obliterate(string[] pathList, ConcurrentDictionary<string, int> progressMonitor, ConcurrentBag<Tuple<string, int>> closedHandlesMonitor)
+        public DeleteFileErrorInfo[] Obliterate(string[] pathList)
         {
             bool isTokenValid = false;
+            this.ProgressData.Clear();
             ConcurrentBag<DeleteFileErrorInfo> errorList = new ConcurrentBag<DeleteFileErrorInfo>();
-
+            
             // Creating the cancellation token source.
             using (CancellationTokenSource tokenSource = new CancellationTokenSource()) {
                 isTokenValid = true;
-
+                
                 // Registering the Ctrl + C handler.
                 Console.CancelKeyPress += (sender, args) => {
                     if (isTokenValid && !tokenSource.IsCancellationRequested)
@@ -302,23 +353,16 @@ namespace Utilities
                     isTokenValid = false;
                 };
 
-                int allDirectoryCount = 0;
-
                 // Enabling privileges to the current token. This will fail if the current token doesn't have these privileges.
-                using (PrivilegeCookie privilegeCookie = AccessControl.Ensure(new string[] { "SeBackupPrivilege", "SeRestorePrivilege" })) {
+                using (PrivilegeCookie privilegeCookie = AccessControl.Request(new string[] { "SeBackupPrivilege", "SeRestorePrivilege" })) {
 
                     // Listing directories and files recursively.
                     // We do this separately so we can have the total count to add to our progress monitor.
                     ConcurrentQueue<Exception> exceptions = new ConcurrentQueue<Exception>();
-                    ConcurrentBag<List<IO.DirectoryFileInformation>> fsObjectInfoListBag = new ConcurrentBag<List<IO.DirectoryFileInformation>>();
+                    ConcurrentBag<IO.DirectoryFileInformation> fsInfoBag = new ConcurrentBag<IO.DirectoryFileInformation>();
                     Parallel.ForEach(pathList, new ParallelOptions { CancellationToken = tokenSource.Token }, path => {
                         try {
-                            List<IO.DirectoryFileInformation> currentList = new List<IO.DirectoryFileInformation>();
-                            IO.GetDirectoryFileInfoRecurse(path, ref currentList, tokenSource.Token);
-
-                            allDirectoryCount += currentList.Count;
-                            progressMonitor["FileCount"] += currentList.Select(info => info.Files.Count).Sum() + allDirectoryCount;
-                            fsObjectInfoListBag.Add(currentList);
+                            IO.GetDirectoryFileInfoRecurse(path, ref fsInfoBag, tokenSource.Token);
                         }
                         catch (Exception ex) {
                             exceptions.Enqueue(ex);
@@ -331,91 +375,79 @@ namespace Utilities
                         throw new AggregateException(exceptions);
                     }
 
+                    // Getting the count of items to delete.
+                    this.ProgressData.TotalCount = fsInfoBag.Select(info => info.Files.Count).Sum() + fsInfoBag.Count;
+
                     // Creating the tasks to delete the files.
-                    List<Task> taskList = new List<Task>(allDirectoryCount);
+                    List<Task> taskList = new List<Task>(fsInfoBag.Count);
                     ConcurrentBag<string> remainingDirectoryBag = new ConcurrentBag<string>();
-                    foreach (List<IO.DirectoryFileInformation> fsInfoList in fsObjectInfoListBag) {
+                    foreach (IO.DirectoryFileInformation fsInfo in fsInfoBag) {
                         tokenSource.Token.ThrowIfCancellationRequested();
 
-                        foreach (IO.DirectoryFileInformation fsInfo in fsInfoList) {
-                            tokenSource.Token.ThrowIfCancellationRequested();
+                        taskList.Add(Task.Run(() => {
+                            switch (fsInfo.Type) {
+                                case IO.FsObjectType.Directory:
 
-                            taskList.Add(Task.Run(() => {
-                                switch (fsInfo.Type) {
-                                    case IO.FsObjectType.Directory:
-
-                                        // If we have a lot of files we process them in parallel.
-                                        if (fsInfo.Files.Count < 500000) {
-                                            for (int j = 0; j < fsInfo.Files.Count; j++) {
-                                                tokenSource.Token.ThrowIfCancellationRequested();
-                                                try {
-                                                    List<int> closedHandleList = new List<int>();
-                                                    IO.DeleteFileClosingOpenHandles(fsInfo.Files[j], tokenSource.Token, ref closedHandleList);
-                                                    foreach (int processId in closedHandleList) {
-                                                        closedHandlesMonitor.Add(new Tuple<string, int>(fsInfo.Files[j], processId));
-                                                    }
-                                                }
-                                                catch (Exception ex) {
-                                                    errorList.Add(new DeleteFileErrorInfo(fsInfo.Files[j], ex));
-                                                }
-                                                progressMonitor["Progress"]++;
+                                    bool hadErrors = false;
+                                    // If we have a lot of files we process them in parallel.
+                                    if (fsInfo.Files.Count < 500000) {
+                                        for (int j = 0; j < fsInfo.Files.Count; j++) {
+                                            tokenSource.Token.ThrowIfCancellationRequested();
+                                            try {
+                                                IO.DeleteObjectClosingOpenHandles(fsInfo.Files[j], IO.FsObjectType.File, InformObjectHandleClosed, tokenSource.Token);
                                             }
+                                            catch (Exception ex) {
+                                                hadErrors = true;
+                                                errorList.Add(new DeleteFileErrorInfo(fsInfo.Files[j], ex));
+                                            }
+                                            this.ProgressData.IncrementProgress();
                                         }
-                                        else {
-                                            Parallel.ForEach(fsInfo.Files, new ParallelOptions() { CancellationToken = tokenSource.Token }, filePath => {
-                                                tokenSource.Token.ThrowIfCancellationRequested();
-                                                try {
-                                                    List<int> closedHandleList = new List<int>();
-                                                    IO.DeleteFileClosingOpenHandles(filePath, tokenSource.Token, ref closedHandleList);
-                                                    foreach (int processId in closedHandleList) {
-                                                        closedHandlesMonitor.Add(new Tuple<string, int>(filePath, processId));
-                                                    }
-                                                }
-                                                catch (Exception ex) {
-                                                    errorList.Add(new DeleteFileErrorInfo(filePath, ex));
-                                                }
-                                                progressMonitor["Progress"]++;
-                                            });
-                                        }
+                                    }
+                                    else {
+                                        Parallel.ForEach(fsInfo.Files, new ParallelOptions() { CancellationToken = tokenSource.Token }, filePath => {
+                                            tokenSource.Token.ThrowIfCancellationRequested();
+                                            try {
+                                                IO.DeleteObjectClosingOpenHandles(filePath, IO.FsObjectType.File, InformObjectHandleClosed, tokenSource.Token);
+                                            }
+                                            catch (Exception ex) {
+                                                hadErrors = true;
+                                                errorList.Add(new DeleteFileErrorInfo(filePath, ex));
+                                            }
+                                            this.ProgressData.IncrementProgress();
+                                        });
+                                    }
 
-                                        // At this point there are no more files in the folder (if nothing failed).
-                                        // So if the folder doesn't have sub-directories we delete it.
+                                    // At this point there are no more files in the folder (if nothing failed).
+                                    // So if the folder doesn't have sub-directories we delete it.
+                                    if (!hadErrors) {
                                         if (!fsInfo.HasSubDirectory) {
                                             try {
-                                                List<int> closedHandleList = new List<int>();
-                                                IO.DeleteDirectoryClosingOpenHandles(fsInfo.FullName, tokenSource.Token, ref closedHandleList);
-                                                foreach (int processId in closedHandleList) {
-                                                    closedHandlesMonitor.Add(new Tuple<string, int>(fsInfo.FullName, processId));
-                                                }
+                                                IO.DeleteObjectClosingOpenHandles(fsInfo.FullName, IO.FsObjectType.Directory, InformObjectHandleClosed, tokenSource.Token);
                                             }
                                             catch (Exception ex) {
                                                 errorList.Add(new DeleteFileErrorInfo(fsInfo.FullName, ex));
                                             }
-                                            progressMonitor["Progress"]++;
+                                            this.ProgressData.IncrementProgress();
                                         }
                                         else
                                             remainingDirectoryBag.Add(fsInfo.FullName);
+                                    }
 
-                                        break;
+                                    break;
 
-                                    case IO.FsObjectType.File:
-                                        try {
-                                            // If it's a file we just delete it.
-                                            List<int> closedHandleList = new List<int>();
-                                            IO.DeleteFileClosingOpenHandles(fsInfo.FullName, tokenSource.Token, ref closedHandleList);
-                                            foreach (int processId in closedHandleList) {
-                                                closedHandlesMonitor.Add(new Tuple<string, int>(fsInfo.FullName, processId));
-                                            }
-                                        }
-                                        catch (Exception ex) {
-                                            errorList.Add(new DeleteFileErrorInfo(fsInfo.FullName, ex));
-                                        }
-                                        progressMonitor["Progress"]++;
+                                case IO.FsObjectType.File:
+                                    try {
+                                        // If it's a file we just delete it.
+                                        IO.DeleteObjectClosingOpenHandles(fsInfo.FullName, IO.FsObjectType.File, InformObjectHandleClosed, tokenSource.Token);
+                                    }
+                                    catch (Exception ex) {
+                                        errorList.Add(new DeleteFileErrorInfo(fsInfo.FullName, ex));
+                                    }
+                                    this.ProgressData.IncrementProgress();
 
-                                        break;
-                                }
-                            }, tokenSource.Token));
-                        }
+                                    break;
+                            }
+                        }, tokenSource.Token));
                     }
 
                     // Waiting the tasks to complete.
@@ -426,16 +458,12 @@ namespace Utilities
                     foreach (string directory in remainingDirectoryBag.OrderByDescending(path => path.Length)) {
                         tokenSource.Token.ThrowIfCancellationRequested();
                         try {
-                            List<int> closedHandleList = new List<int>();
-                            IO.DeleteDirectoryClosingOpenHandles(directory, tokenSource.Token, ref closedHandleList);
-                            foreach (int processId in closedHandleList) {
-                                closedHandlesMonitor.Add(new Tuple<string, int>(directory, processId));
-                            }
+                            IO.DeleteObjectClosingOpenHandles(directory, IO.FsObjectType.Directory, InformObjectHandleClosed, tokenSource.Token);
                         }
                         catch (Exception ex) {
                             errorList.Add(new DeleteFileErrorInfo(directory, ex));
                         }
-                        progressMonitor["Progress"]++;
+                        this.ProgressData.IncrementProgress();
                     }
                 }
             }
@@ -444,7 +472,15 @@ namespace Utilities
 
             return errorList.ToArray();
         }
+
+        private void InformObjectHandleClosed(string path, int processId)
+        {
+            this.ProgressData.AddClosedHandle(path, processId);
+        }
     }
+
+    // Delegate used to raise the 'ObjectHandleClosed' event from the NT API.
+    internal delegate void RaiseObjectHandleClosed(string path, int processId);
 
     // File utilities.
     internal static class IO
@@ -508,8 +544,8 @@ namespace Utilities
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool RemoveDirectory(string lpPathName);
 
-        // Deletes an empty directory.
-        internal static void DeleteDirectoryClosingOpenHandles(string path, CancellationToken token, ref List<int> closedHandleProcessIds)
+        // Deletes a file system object.
+        internal static void DeleteObjectClosingOpenHandles(string path, FsObjectType type, RaiseObjectHandleClosed closedHandleDelegate, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
 
@@ -521,52 +557,20 @@ namespace Utilities
             else
                 finalPath = path;
 
-            if (!RemoveDirectory(finalPath)) {
-                token.ThrowIfCancellationRequested();
-                int lastError = Marshal.GetLastWin32Error();
-
-                // 32 = file is open in another process.
-                if (lastError == 32) {
-
-                    // Opening the file ourselves.
-                    // 128 = FILE_READ_ATTRIBUTES;
-                    // 7 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-                    // 3 = OPEN_EXISTING
-                    // 33554432 = FILE_FLAG_BACKUP_SEMANTICS
-                    using (SafeFileHandle hFile = CreateFile(finalPath, 128, 7, IntPtr.Zero, 3, 33554432, IntPtr.Zero)) {
-                        if (hFile.IsInvalid || hFile.IsClosed)
-                            throw new NativeException(Marshal.GetLastWin32Error());
-
-                        // Attempting to close open handles.
-                        try { NtUtilities.CloseExternalHandlesToFile(hFile, GetFileDevicePathFromDosPath(path), token, ref closedHandleProcessIds); }
-                        catch { }
-
-                        token.ThrowIfCancellationRequested();
-
-                        // At this point if it fails ain't nothing we can do.
-                        if (!DeleteFile(finalPath))
-                            throw new NativeException(Marshal.GetLastWin32Error());
-                    }
-                }
-                else
-                    throw new NativeException(lastError);
+            // Creating a function delegate depending on the object type.
+            Func<string, bool> removalDelegate;
+            switch (type) {
+                case FsObjectType.Directory:
+                    removalDelegate = RemoveDirectory;
+                    break;
+                case FsObjectType.File:
+                    removalDelegate = DeleteFile;
+                    break;
+                default:
+                    throw new ArgumentException("Invalid file system object type: " + type.ToString() + ".");
             }
-        }
 
-        // Deletes a file. If a file has one or more open handles it tries to close them.
-        internal static void DeleteFileClosingOpenHandles(string path, CancellationToken token, ref List<int> closedHandleProcessIds)
-        {
-            token.ThrowIfCancellationRequested();
-
-            // Checking if it's a big path.
-            // Check parameter 'lpFileName' from 'CreateFileW' and 'DeleteFileW'.
-            string finalPath;
-            if (path.Length > 260)
-                finalPath = @"\\?\" + path;
-            else
-                finalPath = path;
-
-            if (!DeleteFile(finalPath)) {
+            if (!removalDelegate(finalPath)) {
                 token.ThrowIfCancellationRequested();
                 int lastError = Marshal.GetLastWin32Error();
 
@@ -579,27 +583,27 @@ namespace Utilities
                     // 3 = OPEN_EXISTING
                     // 33554432 = FILE_FLAG_BACKUP_SEMANTICS
                     using (SafeFileHandle hFile = CreateFile(finalPath, 128, 7, IntPtr.Zero, 3, 33554432, IntPtr.Zero)) {
-                        if (hFile.IsInvalid || hFile.IsClosed)
-                            throw new NativeException(Marshal.GetLastWin32Error());
+                        if (hFile.IsInvalid)
+                            throw new NativeException(Marshal.GetLastWin32Error(), false);
 
                         // Attempting to close open handles.
-                        try { NtUtilities.CloseExternalHandlesToFile(hFile, GetFileDevicePathFromDosPath(path), token, ref closedHandleProcessIds); }
+                        try { NtUtilities.CloseExternalHandlesToFile(hFile, path, closedHandleDelegate, token); }
                         catch { }
 
                         token.ThrowIfCancellationRequested();
 
                         // At this point if it fails ain't nothing we can do.
-                        if (!DeleteFile(finalPath))
-                            throw new NativeException(Marshal.GetLastWin32Error());
+                        if (!removalDelegate(finalPath))
+                            throw new NativeException(Marshal.GetLastWin32Error(), false);
                     }
                 }
                 else
-                    throw new NativeException(lastError);
+                    throw new NativeException(lastError, false);
             }
         }
 
         // Lists files and folders recursively for a directory.
-        internal static unsafe void GetDirectoryFileInfoRecurse(string rootPath, ref List<DirectoryFileInformation> infoList, CancellationToken token)
+        internal static unsafe void GetDirectoryFileInfoRecurse(string rootPath, ref ConcurrentBag<DirectoryFileInformation> infoList, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
 
@@ -628,15 +632,15 @@ namespace Utilities
             // 3 = OPEN_EXISTING
             // 33554432 = FILE_FLAG_BACKUP_SEMANTICS
             using (SafeFileHandle hFile = CreateFile(openHandlePath, 1, 7, IntPtr.Zero, 3, 33554432, IntPtr.Zero)) {
-                if (hFile.IsInvalid || hFile.IsClosed)
-                    throw new NativeException(Marshal.GetLastWin32Error());
+                if (hFile.IsInvalid)
+                    throw new NativeException(Marshal.GetLastWin32Error(), false);
 
                 int bufferSize = 8192;
                 using (ScopedBuffer buffer = new ScopedBuffer(bufferSize)) {
 
                     // Getting the initial buffer;
                     // 2 = FILE_INFORMATION_CLASS.FileFullDirectoryInformation
-                    IO_STATUS_BLOCK statusBlock = default(IO_STATUS_BLOCK);
+                    IO_STATUS_BLOCK statusBlock = new IO_STATUS_BLOCK();
                     int status = NtQueryDirectoryFile(hFile, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, ref statusBlock, buffer, bufferSize, 2, false, IntPtr.Zero, false);
                     if (status != 0)
                         throw new NativeException(status, true);
@@ -660,7 +664,7 @@ namespace Utilities
 
                             currentInfo = (FILE_FULL_DIR_INFORMATION*)offset;
                             string name = currentInfo->FileName;
-
+                            
                             // Skipping system paths.
                             if (name.Equals(".", StringComparison.Ordinal) || name.Equals("..", StringComparison.Ordinal)) {
                                 offset = IntPtr.Add(offset, currentInfo->NextEntryOffset);
@@ -668,8 +672,9 @@ namespace Utilities
                             }
 
                             // Checking if it's a directory.
-                            if ((currentInfo->FileAttributes & 0x00000010) == 0x00000010) {
-
+                            // 16 = FILE_ATTRIBUTE_DIRECTORY
+                            if ((currentInfo->FileAttributes & 16) == 16) {
+                                
                                 // Calling recursively.
                                 GetDirectoryFileInfoRecurse(rootNormalizedName + name, ref infoList, token);
                                 entry.HasSubDirectory = true;
@@ -698,12 +703,12 @@ namespace Utilities
 
         // Converts a 'DOS' path to a device path.
         // E.g., C:\SomeFolder ~> \Device\HardDrive3\SomeFolder
-        private static string GetFileDevicePathFromDosPath(string path)
+        internal static string GetFileDevicePathFromDosPath(string path)
         {
             string drive = string.Format("{0}:", path[0]);
             StringBuilder buffer = new StringBuilder(260);
             if (QueryDosDevice(drive, buffer, 260) == 0)
-                throw new NativeException(Marshal.GetLastWin32Error());
+                throw new NativeException(Marshal.GetLastWin32Error(), false);
 
             return string.Format("{0}\\{1}", buffer.ToString(), path.Remove(0, 3));
         }
@@ -722,8 +727,8 @@ namespace Utilities
         internal static SafeNativeHandle SafeOpenProcess(int desiredAccess, bool inheritHandle, int processId)
         {
             SafeNativeHandle hProcess = OpenProcess(desiredAccess, inheritHandle, processId);
-            if (hProcess.IsInvalid || hProcess.IsClosed)
-                throw new NativeException(Marshal.GetLastWin32Error());
+            if (hProcess.IsInvalid)
+                throw new NativeException(Marshal.GetLastWin32Error(), false);
 
             return hProcess;
         }
@@ -745,17 +750,16 @@ namespace Utilities
         private static extern int NtQueryInformationFile(IntPtr FileHande, ref IO_STATUS_BLOCK IoStatusBlock, IntPtr FileInformation, int Length, int FileInformationClass);
 
         // Attempts to close external handles to a file, searching for the owning processes first.
-        internal static unsafe void CloseExternalHandlesToFile(SafeFileHandle hFile, string devicePath, CancellationToken token, ref List<int> closedHandleProcessIds)
+        internal static unsafe void CloseExternalHandlesToFile(SafeFileHandle hFile, string path, RaiseObjectHandleClosed closedHandleDelegate, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
 
             // Getting the processes that have open handles to this file.
             int bufferSize = 1 << 10;
-            List<int> processIdList = new List<int>();
             IO_STATUS_BLOCK statusBlock = new IO_STATUS_BLOCK();
             using (ScopedBuffer buffer = new ScopedBuffer(bufferSize)) {
                 int status = 0;
-
+                
                 // Since the handle list might change we call this in a loop until we have the right size buffer.
                 // This is somewhat common on NT APIs.
                 do {
@@ -775,27 +779,27 @@ namespace Utilities
 
                 } while (status == -1073741820);
 
-                // Caching the process ID list.
-                FILE_PROCESS_IDS_USING_FILE_INFORMATION* pidUsingFileInfo = (FILE_PROCESS_IDS_USING_FILE_INFORMATION*)(IntPtr)buffer;
-                processIdList.AddRange(pidUsingFileInfo->ProcessIdList);
+                // Calling the method to actually close the handles.
+                // For you C# types out there it's valid to remember we need to call this while 'buffer' is valid.
+                CloseExternalHandlesToFile((FILE_PROCESS_IDS_USING_FILE_INFORMATION*)(IntPtr)buffer, path, closedHandleDelegate, token);
             }
-
-            // Calling the method to actually close the handles.
-            CloseExternalHandlesToFile(processIdList, devicePath, token, ref closedHandleProcessIds);
         }
 
         // Attempts to close external handles to a file from a process ID list.
         // It does that by opening a handle to a process, enumerating its handles, duplicating them, querying information to see
         // if it's a handle to our file, if it is we duplicate again with 'DUPLICATE_CLOSE_SOURCE' to close the original handle
-        private static unsafe void CloseExternalHandlesToFile(List<int> processIdList, string devicePath, CancellationToken token, ref List<int> closedHandleProcessIds)
+        private static unsafe void CloseExternalHandlesToFile(FILE_PROCESS_IDS_USING_FILE_INFORMATION* pidUsingFileInfo, string path, RaiseObjectHandleClosed closedHandleDelegate, CancellationToken token)
         {
-            for (int i = 0; i < processIdList.Count; i++) {
+            string devicePath = IO.GetFileDevicePathFromDosPath(path);
+
+            for (uint i = 0; i < pidUsingFileInfo->NumberOfProcessIdsInList; i++) {
                 token.ThrowIfCancellationRequested();
 
                 // Opening a handle to the process;
                 // 1104 = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE
                 SafeNativeHandle hProcess;
-                try { hProcess = ProcessAndThread.SafeOpenProcess(1104, false, processIdList[i]); }
+                int currentProcessId = (int)(&pidUsingFileInfo->ProcessIdList)[i];
+                try { hProcess = ProcessAndThread.SafeOpenProcess(1104, false, currentProcessId); }
                 catch { continue; }
 
                 using (hProcess) {
@@ -823,13 +827,13 @@ namespace Utilities
                         // Going through each process handle.
                         IntPtr hCurrentProcess = ProcessAndThread.GetCurrentProcess();
                         PROCESS_HANDLE_SNAPSHOT_INFORMATION* processHandleInfo = (PROCESS_HANDLE_SNAPSHOT_INFORMATION*)(IntPtr)buffer;
-                        foreach (PROCESS_HANDLE_TABLE_ENTRY_INFO handleInfo in processHandleInfo->Handles) {
+                        for (int j = 0; j < (int)processHandleInfo->NumberOfHandles; j++) {
                             token.ThrowIfCancellationRequested();
 
                             // Duplicating the handle.
                             // 2 = DUPLICATE_SAME_ACCESS
                             IntPtr hDup;
-                            status = NtDuplicateObject(hProcess.DangerousGetHandle(), handleInfo.HandleValue, hCurrentProcess, out hDup, 0, 0, 2);
+                            status = NtDuplicateObject(hProcess.DangerousGetHandle(), (&processHandleInfo->Handles)[j].HandleValue, hCurrentProcess, out hDup, 0, 0, 2);
                             if (status != 0)
                                 continue;
 
@@ -852,7 +856,7 @@ namespace Utilities
                                     Task<string> getNameTask = Task.Run(() => {
                                         int nameBufferSize = 1024;
                                         string output = string.Empty;
-                                        using (ScopedBuffer nameBuffer =  new ScopedBuffer(nameBufferSize)) {
+                                        using (ScopedBuffer nameBuffer = new ScopedBuffer(nameBufferSize)) {
 
                                             // 1 = OBJECT_INFORMATION_CLASS.ObjectNameInformation
                                             int getNameStatus = NtQueryObject(hDup, 1, nameBuffer, nameBufferSize, out nameBufferSize);
@@ -873,11 +877,11 @@ namespace Utilities
 
                                                 // Duplicating the handle again to close the source.
                                                 // 1 = DUPLICATE_CLOSE_SOURCE
-                                                status = NtDuplicateObject(hProcess.DangerousGetHandle(), handleInfo.HandleValue, hCurrentProcess, out hDup, 0, 0, 1);
+                                                status = NtDuplicateObject(hProcess.DangerousGetHandle(), (&processHandleInfo->Handles)[j].HandleValue, hCurrentProcess, out hDup, 0, 0, 1);
                                                 if (status != 0)
                                                     throw new NativeException(status, true);
 
-                                                closedHandleProcessIds.Add(processIdList[i]);
+                                                closedHandleDelegate(path, currentProcessId);
                                             }
                                         }
 
@@ -917,14 +921,14 @@ namespace Utilities
         private static extern bool GetTokenInformation(SafeAccessTokenHandle TokenHandle, int TokenInformationClass, IntPtr TokenInformation, int TokenInformationLength, out int ReturnLength);
 
         // Ensures that a list of privileges are enabled in the current token.
-        internal static PrivilegeCookie Ensure(string[] privilegeNames)
+        internal static PrivilegeCookie Request(string[] privilegeNames)
         {
             // Opening a handle to the current process token.
             // 40 = TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES
             SafeAccessTokenHandle hToken;
             List<LUID_AND_ATTRIBUTES> enabledLatList = new List<LUID_AND_ATTRIBUTES>();
             if (!OpenProcessToken(ProcessAndThread.GetCurrentProcess(), 40, out hToken))
-                throw new NativeException(Marshal.GetLastWin32Error());
+                throw new NativeException(Marshal.GetLastWin32Error(), false);
 
             // Getting the privilege list for this token.
             Dictionary<string, LUID_AND_ATTRIBUTES> tokenPrivileges = GetTokenPrivileges(hToken);
@@ -936,20 +940,17 @@ namespace Utilities
                     // 1 = SE_PRIVILEGE_ENABLED_BY_DEFAULT
                     // 2 = SE_PRIVILEGE_ENABLED
                     if ((lat.Attributes & 2) != 2 && (lat.Attributes & 1) != 1) {
-                        AdjustTokenPrivileges(hToken, lat, 2);
+                        AdjustTokenPrivileges(hToken, ref lat, 2);
                         enabledLatList.Add(lat);
                     }
                 }
-                else
-                    // A privilege is not held by the client.
-                    throw new NativeException(1314);
             }
 
-            return new PrivilegeCookie(enabledLatList.ToArray(), hToken);
+            return new PrivilegeCookie(enabledLatList, hToken);
         }
 
         // A wrapper for 'AdjustTokenPrivileges'.
-        internal static void AdjustTokenPrivileges(SafeAccessTokenHandle hToken, LUID_AND_ATTRIBUTES luidAndAttributes, uint privilegeAttribute)
+        internal static void AdjustTokenPrivileges(SafeAccessTokenHandle hToken, ref LUID_AND_ATTRIBUTES luidAndAttributes, uint privilegeAttribute)
         {
             TOKEN_PRIVILEGES privileges = new TOKEN_PRIVILEGES() { Privileges = new LUID_AND_ATTRIBUTES[1] { luidAndAttributes } };
 
@@ -957,7 +958,7 @@ namespace Utilities
             privileges.Privileges[0].Attributes = privilegeAttribute;
 
             if (!AdjustTokenPrivileges(hToken, false, ref privileges, 0, IntPtr.Zero, IntPtr.Zero))
-                throw new NativeException(Marshal.GetLastWin32Error());
+                throw new NativeException(Marshal.GetLastWin32Error(), false);
         }
 
         // Lists the privileges to a given token handle.
@@ -974,7 +975,7 @@ namespace Utilities
                 // Getting privilege information.
                 // 3 = TOKEN_INFORMATION_CLASS.TokenPrivileges
                 if (!GetTokenInformation(hToken, 3, buffer, bytesNeeded, out bytesNeeded))
-                    throw new NativeException(Marshal.GetLastWin32Error());
+                    throw new NativeException(Marshal.GetLastWin32Error(), false);
 
                 uint privilegeCount = *(uint*)(IntPtr)buffer;
                 LUID_AND_ATTRIBUTES* privOffset = (LUID_AND_ATTRIBUTES*)((byte*)(IntPtr)buffer + sizeof(uint));
@@ -991,7 +992,7 @@ namespace Utilities
                     uint buffCharSize = 260;
                     StringBuilder nameBuffer = new StringBuilder(260);
                     if (!LookupPrivilegeName(IntPtr.Zero, ref currentPrivilege.Luid, nameBuffer, ref buffCharSize))
-                        throw new NativeException(Marshal.GetLastWin32Error());
+                        throw new NativeException(Marshal.GetLastWin32Error(), false);
 
                     output.Add(nameBuffer.ToString(), currentPrivilege);
 
@@ -1014,10 +1015,10 @@ namespace Utilities
     // Represents one or more privileges added to the current token.
     internal sealed class PrivilegeCookie : IDisposable
     {
-        private readonly LUID_AND_ATTRIBUTES[] _enabledPrivileges;
+        private readonly List<LUID_AND_ATTRIBUTES> _enabledPrivileges;
         private readonly SafeAccessTokenHandle _accessTokenHandle;
 
-        internal PrivilegeCookie(LUID_AND_ATTRIBUTES[] enabledPrivileges, SafeAccessTokenHandle accessTokenHandle)
+        internal PrivilegeCookie(List<LUID_AND_ATTRIBUTES> enabledPrivileges, SafeAccessTokenHandle accessTokenHandle)
         {
             _enabledPrivileges = enabledPrivileges;
             _accessTokenHandle = accessTokenHandle;
@@ -1025,11 +1026,13 @@ namespace Utilities
 
         public void Dispose()
         {
-            foreach (LUID_AND_ATTRIBUTES lat in _enabledPrivileges)
+            for (int i = 0; i < _enabledPrivileges.Count; i++) {
                 // 0 = SE_PRIVILEGE_NONE
                 // If we use 'SE_PRIVILEGE_REMOVED (4)' we remove the privilege from the token.
                 // This is irreversible.
-                AccessControl.AdjustTokenPrivileges(_accessTokenHandle, lat, 0);
+                LUID_AND_ATTRIBUTES lat = _enabledPrivileges[i];
+                AccessControl.AdjustTokenPrivileges(_accessTokenHandle, ref lat, 0);
+            }
 
             _accessTokenHandle.Dispose();
             GC.SuppressFinalize(this);
@@ -1080,10 +1083,10 @@ namespace Utilities
     internal sealed class SafeNativeHandle : SafeHandleZeroOrMinusOneIsInvalid
     {
         internal SafeNativeHandle()
-            : base(ownsHandle: true) { }
+            : base(true) { }
 
         internal SafeNativeHandle(IntPtr existingHandle)
-            : base(ownsHandle: true)
+            : base(true)
         {
             SetHandle(existingHandle);
         }
@@ -1105,7 +1108,7 @@ namespace Utilities
     {
         public int ErrorCode { get; internal set; }
 
-        public NativeException(int errorCode, bool isNt = false)
+        public NativeException(int errorCode, bool isNt)
             : base(GetMessageFromNativeError(errorCode, isNt))
         {
             this.ErrorCode = errorCode;
@@ -1121,7 +1124,7 @@ namespace Utilities
         private static extern IntPtr LocalFree(IntPtr hMem);
 
         // Gets the message from an error code or NTSTATUS.
-        private static string GetMessageFromNativeError(int errorCode, bool isNt = false)
+        private static string GetMessageFromNativeError(int errorCode, bool isNt)
         {
             IntPtr buffer;
             string output = string.Empty;
@@ -1151,6 +1154,7 @@ namespace Utilities
 
     $resolvedPathList = [System.Collections.Generic.List[string]]::new()
 }
+
 Process {
     # Simple provider awareness implementation.
     if ($PSCmdlet.ParameterSetName -eq 'byPath') {
@@ -1178,86 +1182,99 @@ Process {
         }
     }
 }
+
 End {
     # If we couldn't resolve to any path we ball.
     if ($resolvedPathList.Count -lt 1) {
         throw [ArgumentException]::new("The input didn't resolved to any path.")
     }
 
-    # Creating the monitoring objects for the progress and closed handles.
-    $closedHandleMonitor = [System.Collections.Concurrent.ConcurrentBag[Tuple[string, int]]]::new()
-    $messenger = [System.Collections.Concurrent.ConcurrentDictionary[string, int]]::new()
-    [void]$messenger.TryAdd('FileCount', 0)
-    [void]$messenger.TryAdd('Progress', 0)
+    # 'Add-Type' acts differently between Windows PowerShell and PowerShell.
+    if ($PSVersionTable.PSEdition -eq 'Core') {
+        $addTypeSplat = @{
+            TypeDefinition       = $theThing
+            CompilerOptions      = '/unsafe'
+            ReferencedAssemblies = @(
+                'System.Linq.dll'
+                'System.Console.dll'
+                'System.Threading.dll'
+                'System.Collections.dll'
+                'System.Collections.Concurrent.dll'
+                'System.Threading.Tasks.Parallel.dll'
+                'System.Security.Principal.Windows.dll'
+            )
+        }
+        Add-Type @addTypeSplat -ErrorAction Stop
+    }
+    else {
+        $compilerParams = [System.CodeDom.Compiler.CompilerParameters]::new()
+        $compilerParams.CompilerOptions = '/unsafe'
+        [void]$compilerParams.ReferencedAssemblies.Add('System.dll')
+        [void]$compilerParams.ReferencedAssemblies.Add('System.Core.dll')
+        Add-Type -TypeDefinition $theThing -CompilerParameters $compilerParams -ErrorAction Stop
+    }
+
+    # Creating the main object.
+    $obliterator = [Utilities.Obliterator]::new()
 
     # Creating the main task.
-    $ps = [powershell]::Create()
+    $initialSessionState = [initialsessionstate]::CreateDefault()
+    $initialSessionState.ApartmentState = 'MTA'
+    $initialSessionState.Types.Add([System.Management.Automation.Runspaces.SessionStateTypeEntry]::new([System.Management.Automation.Runspaces.TypeData]::new('Utilities.Obliterator'), $false))
+    $ps = [powershell]::Create($initialSessionState)
     try {
         [void]$ps.AddScript({
+            param($ApiSignature, $ResolvedPaths, $Obliterator)
+            return $Obliterator.Obliterate($ResolvedPaths)
+        }).AddParameter('ApiSignature', $theThing).AddParameter('ResolvedPaths', $resolvedPathList.ToArray()).AddParameter('Obliterator', $obliterator)
 
-            param($ApiSignature, $ResolvedPaths, $Messenger, $ClosedHandleMonitor)
-
-            # 'Add-Type' acts differently between Windows PowerShell and PowerShell.
-            if ($PSVersionTable.PSEdition -eq 'Core') {
-                $addTypeSplat = @{
-                    TypeDefinition       = $ApiSignature
-                    CompilerOptions      = '/unsafe'
-                    ReferencedAssemblies = @(
-                        'System.Linq.dll'
-                        'System.Console.dll'
-                        'System.Collections.dll'
-                        'System.Collections.Concurrent.dll'
-                        'System.Threading.Tasks.Parallel.dll'
-                        'System.Security.Principal.Windows.dll'
-                    )
-                }
-                Add-Type @addTypeSplat -ErrorAction Stop
-            }
-            else {
-                $compilerParams = [System.CodeDom.Compiler.CompilerParameters]::new()
-                $compilerParams.CompilerOptions = '/unsafe'
-                [void]$compilerParams.ReferencedAssemblies.Add('System.dll')
-                [void]$compilerParams.ReferencedAssemblies.Add('System.Core.dll')
-                Add-Type -TypeDefinition $ApiSignature -CompilerParameters $compilerParams -ErrorAction Stop
-            }
-
-            # Calling the main API.
-            return [Utilities.Obliterator]::Obliterate($ResolvedPaths, $Messenger, $ClosedHandleMonitor)
-        }).AddParameter('ApiSignature', $theThing).AddParameter('ResolvedPaths', $resolvedPathList.ToArray()).AddParameter('Messenger', $messenger).AddParameter('ClosedHandleMonitor', $closedHandleMonitor)
-
-        # Starting the task and entering the monitoring loop.
+        # Starting the task.
         $handle = $ps.BeginInvoke()
         $spinWait = [System.Threading.SpinWait]::new()
+
+        # The obliterator API does some initialization before kicking off the tasks,
+        # like creating the cancellation token, requesting privileges, and enumerating files and folders.
+        # The last thing it does is set the 'TotalCount'. So we wait.
+        # TODO: Not sure if this is a good idea, I'm tired... Might change in the future.
+        do {
+            $spinWait.SpinOnce()
+        } while ($obliterator.ProgressData.TotalCount -lt 1)
+
+        # The monitoring loop.
+        # In this loop it's important to access the ProgressData properties as little as possible, because it locks it.
         $advertisedClosedHandles = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[int]]]::new()
         do {
+            # Get all the data as a single beautiful atomic operation.
+            $progressData = $obliterator.ProgressData.RequestData()
+
             # Writing progress.
-            if ($messenger.FileCount -gt 0) {
-                Write-Progress -Activity 'Deleting files' -Status "Progress: $($messenger.Progress)/$($messenger.FileCount)" -PercentComplete (($messenger.Progress / $messenger.FileCount) * 100)
+            if ($progressData.Item1 -gt 0) {
+                Write-Progress -Activity 'Deleting files' -Status "Progress: $($progressData.Item2)/$($progressData.Item1)" -PercentComplete (($progressData.Item2 / $progressData.Item1) * 100)
             }
 
             # Checking if any handles were closed for any of the objects.
-            foreach ($closedHandle in $closedHandleMonitor) {
+            foreach ($closedHandleInfo in $progressData.Item3) {
                 $possibleFile = $null
-                if ($advertisedClosedHandles.TryGetValue($closedHandle.Item1, [ref]$possibleFile)) {
+                if ($advertisedClosedHandles.TryGetValue($closedHandleInfo.Item1, [ref]$possibleFile)) {
 
                     # Handles from multiple processes might have been closed for one object.
                     # We alert them all.
-                    if (!$possibleFile.Contains($closedHandle.Item2)) {
-                        Write-Warning "A handle to a file system object was closed. Process ID: $($closedHandle.Item2). Path: $($closedHandle.Item1)."
-                        [void]$advertisedClosedHandles[$closedHandle.Item1].Add($closedHandle.Item2)
+                    if (!$possibleFile.Contains($closedHandleInfo.Item2)) {
+                        Write-Warning "A handle to a file system object was closed. Process ID: $($closedHandleInfo.Item2). Path: $($closedHandleInfo.Item1)."
+                        [void]$advertisedClosedHandles[$closedHandleInfo.Item1].Add($closedHandleInfo.Item2)
                     }
                 }
                 else {
-                    Write-Warning "A handle to a file system object was closed. Process ID: $($closedHandle.Item2). Path: $($closedHandle.Item1)."
-                    [void]$advertisedClosedHandles.Add($closedHandle.Item1, [System.Collections.Generic.List[int]]::new())
-                    [void]$advertisedClosedHandles[$closedHandle.Item1].Add($closedHandle.Item2)
+                    Write-Warning "A handle to a file system object was closed. Process ID: $($closedHandleInfo.Item2). Path: $($closedHandleInfo.Item1)."
+                    [void]$advertisedClosedHandles.Add($closedHandleInfo.Item1, [System.Collections.Generic.List[int]]::new())
+                    [void]$advertisedClosedHandles[$closedHandleInfo.Item1].Add($closedHandleInfo.Item2)
                 }
             }
 
             $spinWait.SpinOnce()
 
         } while ($ps.InvocationStateInfo.State -eq 'Running')
-        Write-Progress -Activity 'Deleting files' -Status "Progress: $($messenger.Progress)/$($messenger.FileCount)" -Completed
+        Write-Progress -Activity 'Deleting files' -Status "Progress: $($obliterator.ProgressData.Progress)/$($obliterator.ProgressData.TotalCount)" -Completed
 
         # Marshaling any errors that might have happened.
         if ($ps.HadErrors -or $ps.Streams.Error.Count -gt 1) {
