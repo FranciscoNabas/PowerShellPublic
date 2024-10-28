@@ -1,5 +1,5 @@
 <#PSScriptInfo
-.VERSION 1.0.1
+.VERSION 1.0.2
 
 .GUID dcb430bf-7683-41f0-a17d-d64fabd18e6e
 
@@ -14,6 +14,20 @@
 .PROJECTURI https://github.com/FranciscoNabas/PowerShellPublic
 
 .RELEASENOTES
+Version 1.0.2:
+    - Added remaining file count to the progress bar.
+    - Added average speed in files/s on the progress bar.
+    - Added the cancellation token to the progress object.
+    - Added check for cancellation on the PowerShell monitoring loop.
+    - Added parameter 'MaxConcurrentTask'.
+    - Various performance enhancements.
+    - Replaced the delete functionality with NT functions.
+    - Removed the threshold for parallel delete.
+    - Added parallel delete for remaining folders.
+    - Removed 'RaiseObjectHandleClosed' unnecessary multiple allocations.
+    - Cancellation handler not working for big number of files. Converted to native and created a scoped handler.
+    - Added task state check while waiting for the API to fill the total count, in case it fails so we don't keep stuck in the loop.
+    - Removed alias.
 Version 1.0.1:
     - Native array enumeration optimization.
     - Consolidated folder and file delete in single method.
@@ -47,6 +61,12 @@ Version 1.0.0:
     The main API tries to enable the 'SeBackupPrivilege' and 'SeRestorePrivilege' for the executing process token during execution to make sure we have the right permissions.
     These privileges are disabled once the method ends.
 
+    About concurrent tasks:
+    This script deletes files and folders in parallel. You can set the maximum number of concurrent tasks by using the 'MaxConcurrentTask' parameter.
+    It's worth noting that there's a point where the bottleneck is on how fast the Operating System can open and close file handles, and not the capacity of the computer
+    of running the tasks, and this number is not big. 1000 concurrent tasks is plenty enough to saturate I/O without frying the CPU. You can play with this parameter to test
+    the limits of your system. MaxConcurrentTask = 0 means no limit.
+
     About cancellation:
     The main API implements a cancellation handler to capture 'Ctrl-C' and 'Ctrl-Break' commands.
     All the internal APIs were designed with cooperative multitasking in mind, so if you press a cancellation combination the operation stops.
@@ -61,13 +81,17 @@ Version 1.0.0:
 
     One or more file system object literal paths (PSPath).
 
+.PARAMETER MaxConcurrentTask
+
+    The maximum number of concurrent delete tasks. Zero means no limit. (see description for more info).
+
 .EXAMPLE
 
     Invoke-Obliteration -Path 'C:\SomeFolderIReallyHate'
 
 .EXAMPLE
 
-    obliterate 'C:\SomeFolderIReallyHate', 'C:\IHateThisOtherOneToo'
+    .\Invoke-Obliteration.ps1 'C:\SomeFolderIReallyHate', 'C:\IHateThisOtherOneToo'
 
 .EXAMPLE
 
@@ -75,7 +99,7 @@ Version 1.0.0:
 
 .EXAMPLE
 
-    Get-ChildItem -Path 'C:\SomeFolder' | obliterate
+    Get-ChildItem -Path 'C:\SomeFolder' | .\Invoke-Obliteration.ps1 -MaxConcurrentTask 0
 
 .INPUTS
 
@@ -83,15 +107,15 @@ Version 1.0.0:
 
 .OUTPUTS
 
-    A 'Utilities.DeleteFileErrorInfo' is return for every object we fail to delete.
+    A 'Obliteration.DeleteFileErrorInfo' is return for every object we fail to delete.
     If no object fails to delete this function returns nothing.
 
 .NOTES
 
     Scripted by: Francisco Nabas
     Scripted on: 2024-10-09
-    Version: 1.0.1
-    Version date: 2024-10-12
+    Version: 1.0.2
+    Version date: 2024-10-27
 
 .LINK
 
@@ -100,8 +124,7 @@ Version 1.0.0:
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'byPath')]
-[Alias('obliterate')]
-[OutputType('DeleteFileErrorInfo')]
+[OutputType('Obliteration.DeleteFileErrorInfo')]
 param (
     [Parameter(
         Mandatory,
@@ -121,12 +144,16 @@ param (
     )]
     [Alias('PSPath')]
     [ValidateNotNullOrEmpty()]
-    [string[]]$LiteralPath
+    [string[]]$LiteralPath,
+
+    [Parameter()]
+    [ValidateRange(0, [int]::MaxValue)]
+    [int]$MaxConcurrentTask = 1000
 )
 
 Begin {
     $theThing = @'
-namespace Utilities
+namespace Obliteration
 {
     using System;
     using System.IO;
@@ -140,21 +167,58 @@ namespace Utilities
     using Microsoft.Win32.SafeHandles;
 
     [StructLayout(LayoutKind.Sequential)]
-    internal struct UNICODE_STRING
+    internal struct UNICODE_STRING : IDisposable
     {
-        private readonly ushort Length;
-        private readonly ushort MaximumLength;
-        private readonly IntPtr Buffer;
+        internal ushort Length;
+        internal ushort MaximumLength;
+        private readonly IntPtr _buffer;
 
-        internal string String { get { return Marshal.PtrToStringUni(Buffer, Length / 2); } }
+        internal UNICODE_STRING(string str)
+        {
+            Length = (ushort)(str.Length * UnicodeEncoding.CharSize);
+            MaximumLength = (ushort)(Length + (UnicodeEncoding.CharSize * 2));
+            _buffer = Marshal.StringToHGlobalUni(str);
+        }
+
+        public override string ToString()
+        {
+            if (_buffer != IntPtr.Zero)
+                return Marshal.PtrToStringUni(_buffer);
+
+            return string.Empty;
+        }
+
+        public void Dispose()
+        {
+            if ( _buffer != IntPtr.Zero )
+                Marshal.FreeHGlobal(_buffer);
+        }
     }
 
-    [StructLayout(LayoutKind.Explicit)]
+    // This is not the correct layout. This struct actually have an union, but
+    // since we're not reading this anywhere I don't care.
+    [StructLayout(LayoutKind.Sequential)]
     internal struct IO_STATUS_BLOCK
     {
-        [FieldOffset(0)] internal int Status;
-        [FieldOffset(0)] internal IntPtr Pointer;
-        [FieldOffset(8)] internal IntPtr Information;
+        internal IntPtr StatusAndPointer;
+        internal IntPtr Information;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal unsafe struct OBJECT_ATTRIBUTES
+    {
+        internal int Length;
+        internal IntPtr RootDirectory;
+        internal IntPtr ObjectName;
+        internal int Attributes;
+        internal IntPtr SecurityDescriptor;
+        internal IntPtr SecurityQualityOfService;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct FILE_DISPOSITION_INFORMATION_EX
+    {
+        internal int Flags;
     }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -190,7 +254,7 @@ namespace Utilities
         internal UIntPtr ProcessIdList;
     }
 
-    // This structure has more members, but we only care aboud the handle value.
+    // This structure has more members, but we only care about the handle value.
     [StructLayout(LayoutKind.Sequential, Size = 40, Pack = 8)]
     internal struct PROCESS_HANDLE_TABLE_ENTRY_INFO
     {
@@ -205,7 +269,7 @@ namespace Utilities
         internal PROCESS_HANDLE_TABLE_ENTRY_INFO Handles;
     }
 
-    // This structure has more members, but we only care aboud the type name.
+    // This structure has more members, but we only care about the type name.
     [StructLayout(LayoutKind.Sequential, Size = 100, Pack = 4)]
     internal struct OBJECT_TYPE_INFORMATION
     {
@@ -241,6 +305,43 @@ namespace Utilities
         internal LUID_AND_ATTRIBUTES[] Privileges;
     }
 
+    // A wrapper for 'OBJECT_ATTRIBUTES'.
+    internal class ManagedObjectAttributes : IDisposable
+    {
+        private bool _isDisposed;
+        private readonly IntPtr _objectName;
+
+        internal OBJECT_ATTRIBUTES ObjectAttributes;
+
+        internal ManagedObjectAttributes(string objectName, int attributes)
+        {
+            int nameSize = objectName.Length * UnicodeEncoding.CharSize;
+
+            UNICODE_STRING nativeObjName = new UNICODE_STRING(objectName);
+            _objectName = Common.HeapAlloc(Marshal.SizeOf(typeof(UNICODE_STRING)));
+            Marshal.StructureToPtr(nativeObjName, _objectName, true);
+
+            ObjectAttributes = new OBJECT_ATTRIBUTES() {
+                Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)),
+                RootDirectory = IntPtr.Zero,
+                ObjectName = _objectName,
+                Attributes = attributes,
+                SecurityDescriptor = IntPtr.Zero,
+                SecurityQualityOfService = IntPtr.Zero,
+            };
+
+            _isDisposed = false;
+        }
+
+        public void Dispose()
+        {
+            if (!_isDisposed) {
+                Marshal.FreeHGlobal(_objectName);
+                _isDisposed = true;
+            }
+        }
+    }
+
     // This object is returned by the main API for files we fail to delete.
     public sealed class DeleteFileErrorInfo
     {
@@ -254,18 +355,6 @@ namespace Utilities
         }
     }
 
-    public sealed class ObjectHandleClosedEventArgs : EventArgs
-    {
-        public string ObjectPath { get; private set; }
-        public int ProcessId { get; private set; }
-
-        internal ObjectHandleClosedEventArgs(string path, int processId)
-        {
-            this.ObjectPath = path;
-            this.ProcessId = processId;
-        }
-    }
-
     public sealed class ObliteratorProgressData
     {
         private readonly object _syncObject = new object();
@@ -273,7 +362,21 @@ namespace Utilities
 
         private int _totalCount = 0;
         private int _progress = 0;
-        
+        private CancellationToken _token;
+
+        public bool IsCancellationRequested {
+            get {
+                lock (_syncObject) {
+                    if (null != _token) {
+                        return _token.IsCancellationRequested;
+                    }
+
+                    return false;
+                }
+            }
+            private set { }
+        }
+
         public int TotalCount {
             get { lock (_syncObject) { return _totalCount; } }
             internal set { lock (_syncObject) { _totalCount = value; } }
@@ -293,10 +396,15 @@ namespace Utilities
             private set { }
         }
 
-        public Tuple<int, int, Tuple<string, int>[]> RequestData()
+        internal CancellationToken Token {
+            get { lock (_syncObject) { return _token; } }
+            set { lock (_syncObject) { _token = value; } }
+        }
+
+        public Tuple<int, int, Tuple<string, int>[], bool> RequestData()
         {
             lock (_syncObject) {
-                return new Tuple<int, int, Tuple<string, int>[]>(_totalCount, _progress, _closedHandleList.ToArray());
+                return new Tuple<int, int, Tuple<string, int>[], bool>(_totalCount, _progress, _closedHandleList.ToArray(), _token.IsCancellationRequested);
             }
         }
 
@@ -327,31 +435,28 @@ namespace Utilities
     // Main class.
     public sealed class Obliterator
     {
+        private readonly RaiseObjectHandleClosed _closeHandleHandler;
+
         public ObliteratorProgressData ProgressData { get; private set; }
 
         public Obliterator()
         {
             this.ProgressData = new ObliteratorProgressData();
+            _closeHandleHandler = new RaiseObjectHandleClosed(InformObjectHandleClosed);
         }
 
         // Main API. Deletes files and directories recursively, closing open handles and storing progress.
-        public DeleteFileErrorInfo[] Obliterate(string[] pathList)
+        public DeleteFileErrorInfo[] Obliterate(string[] pathList, int maxConcurrentTask)
         {
-            bool isTokenValid = false;
+            if (maxConcurrentTask == 0 || maxConcurrentTask < -1)
+                maxConcurrentTask = -1;
+
             this.ProgressData.Clear();
             ConcurrentBag<DeleteFileErrorInfo> errorList = new ConcurrentBag<DeleteFileErrorInfo>();
-            
-            // Creating the cancellation token source.
-            using (CancellationTokenSource tokenSource = new CancellationTokenSource()) {
-                isTokenValid = true;
-                
-                // Registering the Ctrl + C handler.
-                Console.CancelKeyPress += (sender, args) => {
-                    if (isTokenValid && !tokenSource.IsCancellationRequested)
-                        tokenSource.Cancel();
 
-                    isTokenValid = false;
-                };
+            // Creating the cancellation token source.
+            using (CancellationHandler cancellationHandler = new CancellationHandler()) {
+                ProgressData.Token = cancellationHandler.Token;
 
                 // Enabling privileges to the current token. This will fail if the current token doesn't have these privileges.
                 using (PrivilegeCookie privilegeCookie = AccessControl.Request(new string[] { "SeBackupPrivilege", "SeRestorePrivilege" })) {
@@ -360,9 +465,9 @@ namespace Utilities
                     // We do this separately so we can have the total count to add to our progress monitor.
                     ConcurrentQueue<Exception> exceptions = new ConcurrentQueue<Exception>();
                     ConcurrentBag<IO.DirectoryFileInformation> fsInfoBag = new ConcurrentBag<IO.DirectoryFileInformation>();
-                    Parallel.ForEach(pathList, new ParallelOptions { CancellationToken = tokenSource.Token }, path => {
+                    Parallel.ForEach(pathList, new ParallelOptions { CancellationToken = cancellationHandler.Token }, path => {
                         try {
-                            IO.GetDirectoryFileInfoRecurse(path, ref fsInfoBag, tokenSource.Token);
+                            IO.GetDirectoryFileInfoRecurse(path, ref fsInfoBag, cancellationHandler.Token);
                         }
                         catch (Exception ex) {
                             exceptions.Enqueue(ex);
@@ -370,10 +475,8 @@ namespace Utilities
                     });
 
                     // If something failed we ball.
-                    if (!exceptions.IsEmpty) {
-                        isTokenValid = false;
+                    if (!exceptions.IsEmpty)
                         throw new AggregateException(exceptions);
-                    }
 
                     // Getting the count of items to delete.
                     this.ProgressData.TotalCount = fsInfoBag.Select(info => info.Files.Count).Sum() + fsInfoBag.Count;
@@ -382,47 +485,33 @@ namespace Utilities
                     List<Task> taskList = new List<Task>(fsInfoBag.Count);
                     ConcurrentBag<string> remainingDirectoryBag = new ConcurrentBag<string>();
                     foreach (IO.DirectoryFileInformation fsInfo in fsInfoBag) {
-                        tokenSource.Token.ThrowIfCancellationRequested();
+                        cancellationHandler.Token.ThrowIfCancellationRequested();
 
                         taskList.Add(Task.Run(() => {
                             switch (fsInfo.Type) {
                                 case IO.FsObjectType.Directory:
-
                                     bool hadErrors = false;
-                                    // If we have a lot of files we process them in parallel.
-                                    if (fsInfo.Files.Count < 500000) {
-                                        for (int j = 0; j < fsInfo.Files.Count; j++) {
-                                            tokenSource.Token.ThrowIfCancellationRequested();
-                                            try {
-                                                IO.DeleteObjectClosingOpenHandles(fsInfo.Files[j], IO.FsObjectType.File, InformObjectHandleClosed, tokenSource.Token);
-                                            }
-                                            catch (Exception ex) {
-                                                hadErrors = true;
-                                                errorList.Add(new DeleteFileErrorInfo(fsInfo.Files[j], ex));
-                                            }
-                                            this.ProgressData.IncrementProgress();
+                                    Parallel.ForEach(fsInfo.Files, new ParallelOptions() {
+                                        CancellationToken = cancellationHandler.Token,
+                                        MaxDegreeOfParallelism = maxConcurrentTask,
+                                    }, filePath => {
+                                        cancellationHandler.Token.ThrowIfCancellationRequested();
+                                        try {
+                                            NtUtilities.DeleteObjectClosingOpenHandles(filePath, IO.FsObjectType.File, _closeHandleHandler, cancellationHandler.Token);
                                         }
-                                    }
-                                    else {
-                                        Parallel.ForEach(fsInfo.Files, new ParallelOptions() { CancellationToken = tokenSource.Token }, filePath => {
-                                            tokenSource.Token.ThrowIfCancellationRequested();
-                                            try {
-                                                IO.DeleteObjectClosingOpenHandles(filePath, IO.FsObjectType.File, InformObjectHandleClosed, tokenSource.Token);
-                                            }
-                                            catch (Exception ex) {
-                                                hadErrors = true;
-                                                errorList.Add(new DeleteFileErrorInfo(filePath, ex));
-                                            }
-                                            this.ProgressData.IncrementProgress();
-                                        });
-                                    }
+                                        catch (Exception ex) {
+                                            hadErrors = true;
+                                            errorList.Add(new DeleteFileErrorInfo(filePath, ex));
+                                        }
+                                        this.ProgressData.IncrementProgress();
+                                    });
 
                                     // At this point there are no more files in the folder (if nothing failed).
                                     // So if the folder doesn't have sub-directories we delete it.
                                     if (!hadErrors) {
                                         if (!fsInfo.HasSubDirectory) {
                                             try {
-                                                IO.DeleteObjectClosingOpenHandles(fsInfo.FullName, IO.FsObjectType.Directory, InformObjectHandleClosed, tokenSource.Token);
+                                                NtUtilities.DeleteObjectClosingOpenHandles(fsInfo.FullName, IO.FsObjectType.Directory, _closeHandleHandler, cancellationHandler.Token);
                                             }
                                             catch (Exception ex) {
                                                 errorList.Add(new DeleteFileErrorInfo(fsInfo.FullName, ex));
@@ -438,7 +527,7 @@ namespace Utilities
                                 case IO.FsObjectType.File:
                                     try {
                                         // If it's a file we just delete it.
-                                        IO.DeleteObjectClosingOpenHandles(fsInfo.FullName, IO.FsObjectType.File, InformObjectHandleClosed, tokenSource.Token);
+                                        NtUtilities.DeleteObjectClosingOpenHandles(fsInfo.FullName, IO.FsObjectType.File, _closeHandleHandler, cancellationHandler.Token);
                                     }
                                     catch (Exception ex) {
                                         errorList.Add(new DeleteFileErrorInfo(fsInfo.FullName, ex));
@@ -447,28 +536,29 @@ namespace Utilities
 
                                     break;
                             }
-                        }, tokenSource.Token));
+                        }, cancellationHandler.Token));
                     }
 
                     // Waiting the tasks to complete.
-                    Task.WaitAll(taskList.ToArray(), tokenSource.Token);
+                    Task.WaitAll(taskList.ToArray(), cancellationHandler.Token);
 
                     // Deleting remaining directories.
                     // We order by name descending so we delete sub-directories first.
-                    foreach (string directory in remainingDirectoryBag.OrderByDescending(path => path.Length)) {
-                        tokenSource.Token.ThrowIfCancellationRequested();
+                    Parallel.ForEach(remainingDirectoryBag.OrderByDescending(path => path.Length), new ParallelOptions() {
+                        CancellationToken = cancellationHandler.Token,
+                        MaxDegreeOfParallelism = maxConcurrentTask,
+                    }, directory => {
+                        cancellationHandler.Token.ThrowIfCancellationRequested();
                         try {
-                            IO.DeleteObjectClosingOpenHandles(directory, IO.FsObjectType.Directory, InformObjectHandleClosed, tokenSource.Token);
+                            NtUtilities.DeleteObjectClosingOpenHandles(directory, IO.FsObjectType.Directory, _closeHandleHandler, cancellationHandler.Token);
                         }
                         catch (Exception ex) {
                             errorList.Add(new DeleteFileErrorInfo(directory, ex));
                         }
                         this.ProgressData.IncrementProgress();
-                    }
+                    });
                 }
             }
-
-            isTokenValid = false;
 
             return errorList.ToArray();
         }
@@ -487,8 +577,8 @@ namespace Utilities
     {
         internal enum FsObjectType
         {
-            Directory,
-            File,
+            Directory = 0x204001,
+            File = 0x204048,
         }
 
         internal sealed class DirectoryFileInformation
@@ -508,99 +598,14 @@ namespace Utilities
         }
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "CreateFileW")]
-        private static extern SafeFileHandle CreateFile(
-            string lpFileName,
-            int dwDesiredAccess,
-            int dwShareMode,
-            IntPtr lpSecurityAttributes,
-            int dwCreationDisposition,
-            int dwFlagsAndAttributes,
-            IntPtr hTemplateFile
-        );
+        private static extern SafeFileHandle CreateFile(string lpFileName, int dwDesiredAccess, int dwShareMode, IntPtr lpSecurityAttributes, int dwCreationDisposition, int dwFlagsAndAttributes, IntPtr hTemplateFile);
 
         [DllImport("ntdll.dll", SetLastError = true)]
-        private static extern int NtQueryDirectoryFile(
-            SafeFileHandle FileHandle,
-            IntPtr Event,
-            IntPtr ApcRoutine, // IO_APC_ROUTINE*
-            IntPtr ApcContext,
-            ref IO_STATUS_BLOCK IoStatusBlock,
-            IntPtr FileInformation,
-            int Length,
-            int FileInformationClass,
-            bool ReturnSingleEntry,
-            IntPtr FileName, // UNICODE_STRING*
-            bool RestartScan
-        );
+        private static extern int NtQueryDirectoryFile(SafeFileHandle FileHandle, IntPtr Event, IntPtr ApcRoutine,  IntPtr ApcContext, ref IO_STATUS_BLOCK IoStatusBlock, IntPtr FileInformation,
+            int Length, int FileInformationClass, bool ReturnSingleEntry, IntPtr FileName,  bool RestartScan);
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "QueryDosDeviceW")]
         private static extern int QueryDosDevice(string lpDeviceName, StringBuilder lpTargetPath, int ucchMax);
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "DeleteFileW")]
-        [return:  MarshalAs(UnmanagedType.Bool)]
-        private static extern bool DeleteFile(string lpFileName);
-
-        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "RemoveDirectoryW")]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool RemoveDirectory(string lpPathName);
-
-        // Deletes a file system object.
-        internal static void DeleteObjectClosingOpenHandles(string path, FsObjectType type, RaiseObjectHandleClosed closedHandleDelegate, CancellationToken token)
-        {
-            token.ThrowIfCancellationRequested();
-
-            // Checking if it's a big path.
-            // Check parameter 'lpPathName' from 'RemoveDirectoryW'.
-            string finalPath;
-            if (path.Length > 260)
-                finalPath = @"\\?\" + path;
-            else
-                finalPath = path;
-
-            // Creating a function delegate depending on the object type.
-            Func<string, bool> removalDelegate;
-            switch (type) {
-                case FsObjectType.Directory:
-                    removalDelegate = RemoveDirectory;
-                    break;
-                case FsObjectType.File:
-                    removalDelegate = DeleteFile;
-                    break;
-                default:
-                    throw new ArgumentException("Invalid file system object type: " + type.ToString() + ".");
-            }
-
-            if (!removalDelegate(finalPath)) {
-                token.ThrowIfCancellationRequested();
-                int lastError = Marshal.GetLastWin32Error();
-
-                // 32 = file is open in another process.
-                if (lastError == 32) {
-
-                    // Opening the file ourselves.
-                    // 128 = FILE_READ_ATTRIBUTES;
-                    // 7 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
-                    // 3 = OPEN_EXISTING
-                    // 33554432 = FILE_FLAG_BACKUP_SEMANTICS
-                    using (SafeFileHandle hFile = CreateFile(finalPath, 128, 7, IntPtr.Zero, 3, 33554432, IntPtr.Zero)) {
-                        if (hFile.IsInvalid)
-                            throw new NativeException(Marshal.GetLastWin32Error(), false);
-
-                        // Attempting to close open handles.
-                        try { NtUtilities.CloseExternalHandlesToFile(hFile, path, closedHandleDelegate, token); }
-                        catch { }
-
-                        token.ThrowIfCancellationRequested();
-
-                        // At this point if it fails ain't nothing we can do.
-                        if (!removalDelegate(finalPath))
-                            throw new NativeException(Marshal.GetLastWin32Error(), false);
-                    }
-                }
-                else
-                    throw new NativeException(lastError, false);
-            }
-        }
 
         // Lists files and folders recursively for a directory.
         internal static unsafe void GetDirectoryFileInfoRecurse(string rootPath, ref ConcurrentBag<DirectoryFileInformation> infoList, CancellationToken token)
@@ -664,7 +669,7 @@ namespace Utilities
 
                             currentInfo = (FILE_FULL_DIR_INFORMATION*)offset;
                             string name = currentInfo->FileName;
-                            
+
                             // Skipping system paths.
                             if (name.Equals(".", StringComparison.Ordinal) || name.Equals("..", StringComparison.Ordinal)) {
                                 offset = IntPtr.Add(offset, currentInfo->NextEntryOffset);
@@ -674,7 +679,7 @@ namespace Utilities
                             // Checking if it's a directory.
                             // 16 = FILE_ATTRIBUTE_DIRECTORY
                             if ((currentInfo->FileAttributes & 16) == 16) {
-                                
+
                                 // Calling recursively.
                                 GetDirectoryFileInfoRecurse(rootNormalizedName + name, ref infoList, token);
                                 entry.HasSubDirectory = true;
@@ -738,6 +743,13 @@ namespace Utilities
     internal static class NtUtilities
     {
         [DllImport("ntdll.dll", SetLastError = true)]
+        private static unsafe extern int NtOpenFile(out IntPtr FileHandle, int DesiredAccess, OBJECT_ATTRIBUTES ObjectAttributes, ref IO_STATUS_BLOCK IoStatusBlock, int ShareAccess, int OpenOptions);
+
+        // 'FileInformation' here is a PVOID, but since we only use with this structure we take advantage of that.
+        [DllImport("ntdll.dll", SetLastError = true)]
+        private static extern int NtSetInformationFile(IntPtr FileHandle, ref IO_STATUS_BLOCK IoStatusBlock, ref FILE_DISPOSITION_INFORMATION_EX FileInformation, int Length, int FileInformationClass);
+
+        [DllImport("ntdll.dll", SetLastError = true)]
         private static extern int NtQueryObject(IntPtr Handle, int ObjectInformationClass, IntPtr ObjectInformation, int ObjectInformationLength, out int ReturnLength);
 
         [DllImport("ntdll.dll", SetLastError = true)]
@@ -747,10 +759,79 @@ namespace Utilities
         private static extern int NtQueryInformationProcess(IntPtr ProcessHandle, int SystemInformationClass, IntPtr SystemInformation, int SystemInformationLength, out int ReturnLength);
 
         [DllImport("ntdll.dll", SetLastError = true)]
-        private static extern int NtQueryInformationFile(IntPtr FileHande, ref IO_STATUS_BLOCK IoStatusBlock, IntPtr FileInformation, int Length, int FileInformationClass);
+        private static extern int NtQueryInformationFile(IntPtr FileHandle, ref IO_STATUS_BLOCK IoStatusBlock, IntPtr FileInformation, int Length, int FileInformationClass);
+
+        [DllImport("ntdll.dll", SetLastError = true)]
+        internal static extern int NtClose(IntPtr Handle);
+
+
+        // Attempts to delete a file or folder closing open handles to it.
+        internal static unsafe void DeleteObjectClosingOpenHandles(string path, IO.FsObjectType type, RaiseObjectHandleClosed closedHandleDelegate, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested();
+
+            // Since the path is the result of a directory enumeration we know two things, this object exists (unless
+            // it was deleted/moved in between), and it's either a file or a folder. So we can get away with just prepending
+            // '\??\' to the path instead of calling 'RtlDosPathNameToRelativeNtPathName_U_WithStatus' (I think lol).
+            string ntFileName = @"\??\" + path;
+
+            // 65536 = DELETE
+            int desiredAccess = 65536;
+
+            // Directory: 0x204001 = FILE_OPEN_REPARSE_POINT | FILE_OPEN_FOR_BACKUP_INTENT | FILE_DIRECTORY_FILE
+            // File: 0x200048 = FILE_OPEN_REPARSE_POINT | FILE_NO_INTERMEDIATE_BUFFERING | FILE_OPEN_FOR_BACKUP_INTENT | FILE_NON_DIRECTORY_FILE
+            int openOptions = (int)type;
+
+            int status;
+            IntPtr hFile;
+            IO_STATUS_BLOCK statusBlock = new IO_STATUS_BLOCK();
+
+            // 64 = OBJ_CASE_INSENSITIVE.
+            using (ManagedObjectAttributes objAttributes = new ManagedObjectAttributes(ntFileName, 64)) {
+
+                // FILE_DELETE_ON_CLOSE is twice as slow.
+                // 7 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                status = NtOpenFile(out hFile, desiredAccess, objAttributes.ObjectAttributes, ref statusBlock, 7, openOptions);
+                if (status != 0) {
+
+                    // 0xC0000043 = STATUS_SHARE_VIOLATION. File is open in another process.
+                    if (status == -1073741757) {
+
+                        // 128 = FILE_READ_ATTRIBUTES
+                        // 7 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+                        status = NtOpenFile(out hFile, 128, objAttributes.ObjectAttributes, ref statusBlock, 7, openOptions);
+                        if (status != 0)
+                            throw new NativeException(status, true);
+
+                        // Attempting to close open handles.
+                        try { CloseExternalHandlesToFile(hFile, path, closedHandleDelegate, token); }
+                        catch { }
+
+                        NtClose(hFile);
+
+                        // At this point if it fails ain't nothing we can do.
+                        status = NtOpenFile(out hFile, desiredAccess, objAttributes.ObjectAttributes, ref statusBlock, 7, openOptions);
+                        if (status != 0)
+                            throw new NativeException(status, true);
+                    }
+                    else
+                        throw new NativeException(status, true);
+                }
+            }
+
+            // 19 = FILE_DISPOSITION_DELETE | FILE_DISPOSITION_POSIX_SEMANTICS | FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE
+            FILE_DISPOSITION_INFORMATION_EX dispositionInfo = new FILE_DISPOSITION_INFORMATION_EX() { Flags = 19 };
+
+            // 64 = FileDispositionInformationEx
+            status = NtSetInformationFile(hFile, ref statusBlock, ref dispositionInfo, 4, 64);
+            if (status != 0)
+                throw new NativeException(status, true);
+
+            NtClose(hFile);
+        }
 
         // Attempts to close external handles to a file, searching for the owning processes first.
-        internal static unsafe void CloseExternalHandlesToFile(SafeFileHandle hFile, string path, RaiseObjectHandleClosed closedHandleDelegate, CancellationToken token)
+        internal static unsafe void CloseExternalHandlesToFile(IntPtr hFile, string path, RaiseObjectHandleClosed closedHandleDelegate, CancellationToken token)
         {
             token.ThrowIfCancellationRequested();
 
@@ -759,14 +840,14 @@ namespace Utilities
             IO_STATUS_BLOCK statusBlock = new IO_STATUS_BLOCK();
             using (ScopedBuffer buffer = new ScopedBuffer(bufferSize)) {
                 int status = 0;
-                
+
                 // Since the handle list might change we call this in a loop until we have the right size buffer.
                 // This is somewhat common on NT APIs.
                 do {
                     token.ThrowIfCancellationRequested();
 
                     // 47 = FILE_INFORMATION_CLASS.FileProcessIdsUsingFileInformation
-                    status = NtQueryInformationFile(hFile.DangerousGetHandle(), ref statusBlock, buffer, bufferSize, 47);
+                    status = NtQueryInformationFile(hFile, ref statusBlock, buffer, bufferSize, 47);
                     if (status == 0)
                         break;
 
@@ -848,10 +929,10 @@ namespace Utilities
                                 }
 
                                 // If it's a file we go further.
-                                var typeName = ((OBJECT_TYPE_INFORMATION*)(IntPtr)typeBuffer)->TypeName.String.Trim('\0');
+                                var typeName = ((OBJECT_TYPE_INFORMATION*)(IntPtr)typeBuffer)->TypeName.ToString().Trim('\0');
                                 if (typeName.Equals("File", StringComparison.OrdinalIgnoreCase)) {
 
-                                    // Querying the object name. We do this in a task because some asyncrhonous objects, like pipes
+                                    // Querying the object name. We do this in a task because some asynchronous objects, like pipes
                                     // block the call to 'NtQueryObject' forever.
                                     Task<string> getNameTask = Task.Run(() => {
                                         int nameBufferSize = 1024;
@@ -863,7 +944,7 @@ namespace Utilities
                                             if (status != 0)
                                                 throw new NativeException(status, true);
 
-                                            output = ((OBJECT_NAME_INFORMATION*)(IntPtr)nameBuffer)->Name.String;
+                                            output = ((OBJECT_NAME_INFORMATION*)(IntPtr)nameBuffer)->Name.ToString();
                                         }
 
                                         return output;
@@ -905,9 +986,6 @@ namespace Utilities
     {
         [DllImport("Advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern bool OpenProcessToken(IntPtr ProcessHandle, int DesiredAccess, out SafeAccessTokenHandle pHandle);
-
-        [DllImport("Advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "LookupPrivilegeValueW")]
-        private static extern bool LookupPrivilegeValue(string lpSystemName, string lpName, ref LUID lpLuid);
 
         [DllImport("Advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "LookupPrivilegeNameW")]
         [return: MarshalAs(UnmanagedType.Bool)]
@@ -952,9 +1030,11 @@ namespace Utilities
         // A wrapper for 'AdjustTokenPrivileges'.
         internal static void AdjustTokenPrivileges(SafeAccessTokenHandle hToken, ref LUID_AND_ATTRIBUTES luidAndAttributes, uint privilegeAttribute)
         {
-            TOKEN_PRIVILEGES privileges = new TOKEN_PRIVILEGES() { Privileges = new LUID_AND_ATTRIBUTES[1] { luidAndAttributes } };
+            TOKEN_PRIVILEGES privileges = new TOKEN_PRIVILEGES() {
+                PrivilegeCount = 1,
+                Privileges = new LUID_AND_ATTRIBUTES[1] { luidAndAttributes },
+            };
 
-            privileges.PrivilegeCount = 1;
             privileges.Privileges[0].Attributes = privilegeAttribute;
 
             if (!AdjustTokenPrivileges(hToken, false, ref privileges, 0, IntPtr.Zero, IntPtr.Zero))
@@ -978,13 +1058,13 @@ namespace Utilities
                     throw new NativeException(Marshal.GetLastWin32Error(), false);
 
                 uint privilegeCount = *(uint*)(IntPtr)buffer;
-                LUID_AND_ATTRIBUTES* privOffset = (LUID_AND_ATTRIBUTES*)((byte*)(IntPtr)buffer + sizeof(uint));
+                LUID_AND_ATTRIBUTES* privilegeOffset = (LUID_AND_ATTRIBUTES*)((byte*)(IntPtr)buffer + sizeof(uint));
                 for (uint i = 0; i < privilegeCount; i++) {
                     LUID_AND_ATTRIBUTES currentPrivilege = new LUID_AND_ATTRIBUTES() {
-                        Attributes = privOffset->Attributes,
+                        Attributes = privilegeOffset->Attributes,
                         Luid = new LUID() {
-                            LowPart = privOffset->Luid.LowPart,
-                            HighPart = privOffset->Luid.HighPart,
+                            LowPart = privilegeOffset->Luid.LowPart,
+                            HighPart = privilegeOffset->Luid.HighPart,
                         }
                     };
 
@@ -996,7 +1076,7 @@ namespace Utilities
 
                     output.Add(nameBuffer.ToString(), currentPrivilege);
 
-                    privOffset++;
+                    privilegeOffset++;
                 }
             }
 
@@ -1007,9 +1087,91 @@ namespace Utilities
     // Common utilities.
     internal static class Common
     {
+        internal delegate bool HandlerRoutineDelegate(uint dwCtrlType);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr HeapAlloc(IntPtr hHeap, int dwFlags, long dwBytes);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool SetConsoleCtrlHandler(HandlerRoutineDelegate HandlerRoutine, bool Add);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr GetProcessHeap();
+
         [DllImport("kernel32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         internal static extern bool CloseHandle(IntPtr hObject);
+
+        internal static IntPtr HeapAlloc(long size)
+        {
+            // 8 = HEAP_ZERO_MEMORY
+            IntPtr buffer = HeapAlloc(GetProcessHeap(), 8, size);
+            if (buffer == IntPtr.Zero)
+                throw new OutOfMemoryException();
+
+            return buffer;
+        }
+    }
+
+    internal sealed class CancellationHandler : IDisposable
+    {
+        private readonly CancellationTokenSource _tokenSource;
+        private readonly Common.HandlerRoutineDelegate _handler;
+
+        private bool _isDisposed;
+
+        internal CancellationToken Token {
+            get { return _tokenSource.Token; }
+            private set { }
+        }
+
+        internal CancellationHandler()
+        {
+            _handler = new Common.HandlerRoutineDelegate(HandleControl);
+            _tokenSource = new CancellationTokenSource();
+
+            if (!Common.SetConsoleCtrlHandler(_handler, true))
+                throw new NativeException(Marshal.GetLastWin32Error(), false);
+
+            _isDisposed = false;
+        }
+
+        ~CancellationHandler()
+        {
+            Dispose(disposing: false);
+        }
+
+        public void Dispose()
+        {
+            Dispose(disposing: true);
+            GC.SuppressFinalize(this);
+        }
+
+        private void Dispose(bool disposing)
+        {
+            if (disposing && !_isDisposed) {
+                _tokenSource.Dispose();
+                _isDisposed = true;
+                Common.SetConsoleCtrlHandler(_handler, false);
+            }
+        }
+
+        private bool HandleControl(uint type)
+        {
+            switch (type) {
+                case 0:
+                case 1:
+                    if (!_isDisposed && !_tokenSource.IsCancellationRequested) {
+                        _tokenSource.Cancel();
+                        return true;
+                    }
+                    else
+                        return false;
+                default:
+                    return false;
+            }
+        }
     }
 
     // Represents one or more privileges added to the current token.
@@ -1099,7 +1261,7 @@ namespace Utilities
 
         protected override bool ReleaseHandle()
         {
-            return Common.CloseHandle(handle);
+            return NtUtilities.NtClose(handle) == 0;
         }
     }
 
@@ -1170,15 +1332,20 @@ Process {
     foreach ($singlePath in $pathList) {
         $driveInfo = $null
         $providerInfo = $null
-        if ($shouldExpandWildcards) {
-            $resolvedPathList.AddRange($PSCmdlet.GetResolvedProviderPathFromPSPath($singlePath, [ref]$providerInfo))
-        }
-        else {
-            $resolvedPathList.Add($PSCmdlet.SessionState.Path.GetUnresolvedProviderPathFromPSPath($singlePath, [ref]$providerInfo, [ref]$driveInfo))
-        }
+        try {
+            if ($shouldExpandWildcards) {
+                $resolvedPathList.AddRange($PSCmdlet.GetResolvedProviderPathFromPSPath($singlePath, [ref]$providerInfo))
+            }
+            else {
+                $resolvedPathList.Add($PSCmdlet.SessionState.Path.GetUnresolvedProviderPathFromPSPath($singlePath, [ref]$providerInfo, [ref]$driveInfo))
+            }
 
-        if ($providerInfo.Name -ne 'FileSystem') {
-            throw [ArgumentException]::new("This function can't be used with the '$($providerInfo.Name)' provider.")
+            if ($providerInfo.Name -ne 'FileSystem') {
+                throw [ArgumentException]::new("This function can't be used with the '$($providerInfo.Name)' provider.")
+            }
+        }
+        catch {
+            Write-Error -ErrorRecord $_
         }
     }
 }
@@ -1200,6 +1367,7 @@ End {
                 'System.Threading.dll'
                 'System.Collections.dll'
                 'System.Collections.Concurrent.dll'
+                'System.Text.Encoding.Extensions.dll'
                 'System.Threading.Tasks.Parallel.dll'
                 'System.Security.Principal.Windows.dll'
             )
@@ -1215,18 +1383,18 @@ End {
     }
 
     # Creating the main object.
-    $obliterator = [Utilities.Obliterator]::new()
+    $obliterator = [Obliteration.Obliterator]::new()
 
     # Creating the main task.
     $initialSessionState = [initialsessionstate]::CreateDefault()
     $initialSessionState.ApartmentState = 'MTA'
-    $initialSessionState.Types.Add([System.Management.Automation.Runspaces.SessionStateTypeEntry]::new([System.Management.Automation.Runspaces.TypeData]::new('Utilities.Obliterator'), $false))
+    $initialSessionState.Types.Add([System.Management.Automation.Runspaces.SessionStateTypeEntry]::new([System.Management.Automation.Runspaces.TypeData]::new('Obliteration.Obliterator'), $false))
     $ps = [powershell]::Create($initialSessionState)
     try {
         [void]$ps.AddScript({
-            param($ApiSignature, $ResolvedPaths, $Obliterator)
-            return $Obliterator.Obliterate($ResolvedPaths)
-        }).AddParameter('ApiSignature', $theThing).AddParameter('ResolvedPaths', $resolvedPathList.ToArray()).AddParameter('Obliterator', $obliterator)
+                param($ResolvedPaths, $Obliterator, $MaxConcurrentTask)
+                return $Obliterator.Obliterate($ResolvedPaths, $MaxConcurrentTask)
+            }).AddParameter('ResolvedPaths', $resolvedPathList.ToArray()).AddParameter('Obliterator', $obliterator).AddParameter('MaxConcurrentTask', $MaxConcurrentTask)
 
         # Starting the task.
         $handle = $ps.BeginInvoke()
@@ -1238,18 +1406,43 @@ End {
         # TODO: Not sure if this is a good idea, I'm tired... Might change in the future.
         do {
             $spinWait.SpinOnce()
-        } while ($obliterator.ProgressData.TotalCount -lt 1)
+        } while ($obliterator.ProgressData.TotalCount -lt 1 -and $ps.InvocationStateInfo.State -eq 'Running')
 
         # The monitoring loop.
         # In this loop it's important to access the ProgressData properties as little as possible, because it locks it.
+        $filesPerSecond = 0
+        $previousProgress = 0
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $advertisedClosedHandles = [System.Collections.Generic.Dictionary[string, System.Collections.Generic.List[int]]]::new()
         do {
             # Get all the data as a single beautiful atomic operation.
+            # [int] Item1: Total count.
+            # [int] Item2: Progress (completed count).
+            # [Tuple[string, int]][] Item3: Closed handle info. (Item1: File name; Item2: Process ID).
+            # [bool]: Item4: Is cancellation requested.
             $progressData = $obliterator.ProgressData.RequestData()
+
+            # If cancellation was requested we ball.
+            if ($progressData.Item4) {
+                break
+            }
+
+            # Calcullating the average speed in files/s. This displays approximately every second.
+            $elapsedSeconds = $sw.Elapsed.TotalSeconds
+            if ($elapsedSeconds -gt 1) {
+
+                # Calculating the interval progress and rounding it to an integer number.
+                $delta = $progressData.Item2 - $previousProgress
+                $filesPerSecond = [Math]::Round(($delta / $elapsedSeconds), 0)
+
+                # Storing current progress and restarting the stop watch.
+                $previousProgress = $progressData.Item2
+                $sw.Restart()
+            }
 
             # Writing progress.
             if ($progressData.Item1 -gt 0) {
-                Write-Progress -Activity 'Deleting files' -Status "Progress: $($progressData.Item2)/$($progressData.Item1)" -PercentComplete (($progressData.Item2 / $progressData.Item1) * 100)
+                Write-Progress -Activity 'Deleting files' -Status "Progress: $($progressData.Item2)/$($progressData.Item1) ($($progressData.Item1 - $progressData.Item2)). Speed: $filesPerSecond files/s." -PercentComplete (($progressData.Item2 / $progressData.Item1) * 100)
             }
 
             # Checking if any handles were closed for any of the objects.
@@ -1271,6 +1464,7 @@ End {
                 }
             }
 
+            # Creating some entropy and giving the CPU some time to breathe.
             $spinWait.SpinOnce()
 
         } while ($ps.InvocationStateInfo.State -eq 'Running')
